@@ -13,6 +13,7 @@ dependencies = [
     "pandas>=2.3.1",
     "prefect>=3.4.10",
     "scikit-learn>=1.7.1",
+    "sqlalchemy>=2.0.41",
     "statsmodels>=0.14.5",
     "tqdm>=4.67.1",
     "xgboost>=3.0.2",
