@@ -11,3 +11,14 @@ wheels/
 
 # Environment variables
 .env
+
+# Data
+*.csv
+*.parquet
+*.pickle
+*.pkl
+*.json
+*.jsonl
+*.jsonl.gz
+*.jsonl.bz2
+*.jsonl.xz
