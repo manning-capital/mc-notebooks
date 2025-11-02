@@ -1,4 +1,4 @@
-name: Deploy Prefect
+name: Deploy MC Docker Image
 
 on:
   push:
