@@ -13,19 +13,19 @@ This module works with the following database tables (ORM models):
 1. ProviderAssetGroup (models.ProviderAssetGroup)
    - Represents groups of asset pairs for pairs trading analysis
    - Primary key: id
-   
+
 2. ProviderAssetGroupMember (models.ProviderAssetGroupMember)
    - Defines the two assets in each pairs trading group
    - Links: provider_asset_group_id -> ProviderAssetGroup.id
    - Fields: provider_id, from_asset_id, to_asset_id, order (1 or 2)
    - Each group has exactly 2 members (order=1 and order=2)
-   
+
 3. ProviderAssetMarket (models.ProviderAssetMarket)
    - Contains historical market data (OHLCV) for asset pairs
    - Links to assets via: provider_id, from_asset_id, to_asset_id
    - Fields: timestamp, open, high, low, close, volume
    - Indexed by timestamp for efficient time-series queries
-   
+
 4. ProviderAssetGroupAttribute (models.ProviderAssetGroupAttribute)
    - Stores computed cointegration statistics for each group
    - Links: provider_asset_group_id -> ProviderAssetGroup.id
@@ -49,9 +49,7 @@ import pandas as pd
 import statsmodels.api as sm
 from dask import delayed
 from dask.diagnostics import ProgressBar
-from dask.distributed import Client
 from prefect import flow, get_run_logger
-from prefect.blocks.system import Secret
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from statsmodels.tsa.stattools import coint
@@ -68,6 +66,7 @@ from src.utils.stochastic_models import OrnsteinUhlenbeck
 DEFAULT_N_WORKERS = 20
 DEFAULT_MAX_GROUPS = 5000
 
+
 @delayed
 def load_pairs_trading_frame_chunk(
     start: dt.datetime,
@@ -78,7 +77,7 @@ def load_pairs_trading_frame_chunk(
     """
     Load the pairs trading frame for a chunk of provider asset groups.
     Returns only the essential columns needed for cointegration analysis.
-    
+
     This function joins data from ProviderAssetGroupMember with ProviderAssetMarket
     to create time-series pairs of closing prices for cointegration testing.
 
@@ -145,7 +144,7 @@ def get_pairs_trading_frame(
 ) -> dd.DataFrame:
     """
     Get the pairs trading frame with only essential columns for cointegration analysis.
-    
+
     This function parallelizes the loading of pairs trading data across multiple
     ProviderAssetGroup IDs using Dask delayed execution.
 
@@ -177,7 +176,9 @@ def get_pairs_trading_frame(
         ].copy()
 
         delayed_dfs.append(
-            load_pairs_trading_frame_chunk(start, end, members_chunk, market_data_future)
+            load_pairs_trading_frame_chunk(
+                start, end, members_chunk, market_data_future
+            )
         )
 
     # Define minimal schema
@@ -204,10 +205,10 @@ def get_pairs_trading_frame(
 def get_cointegrated_stats(df: pd.DataFrame) -> pd.Series:
     """
     Calculate cointegration statistics for a pair of assets.
-    
+
     Performs OLS linear regression on the two price series and fits an
     Ornstein-Uhlenbeck process to the residuals to model mean reversion behavior.
-    
+
     These statistics are written to the ProviderAssetGroupAttribute table.
 
     Args:
@@ -275,7 +276,7 @@ def save_pairs_trading_attributes(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Prefect flow: Run comprehensive pairs trading analysis for a given date and lookback period.
-    
+
     This function performs the following workflow:
     1. Retrieves postgres_url from Prefect Secret block
     2. Loads ProviderAssetGroup IDs to analyze
@@ -297,18 +298,18 @@ def save_pairs_trading_attributes(
             - cointegration_p_values_df: DataFrame with p_value for each group
             - cointegrated_pairs_stats_df: DataFrame with detailed statistics for
               cointegrated pairs (empty if no pairs pass the cointegration test)
-    
+
     Configuration:
         - Uses Coiled cluster with configuration from flow decorator
         - PostgreSQL URL retrieved from Prefect Secret 'postgres-url'
         - Uses DEFAULT_MAX_GROUPS and DEFAULT_N_WORKERS constants for processing
     """
     logger = get_run_logger()
-    
+
     # Use current date if not specified
     if date is None:
         date = dt.datetime.now(dt.timezone.utc).date()
-    
+
     # Get the database engine.
     engine = get_engine()
 
@@ -405,14 +406,18 @@ def save_pairs_trading_attributes(
         cointegration_p_values = pairs_trading_frame.groupby("provider_asset_group_id")[
             ["close_1", "close_2"]
         ].apply(
-            lambda df: pd.Series(coint(df["close_1"], df["close_2"])[1], index=["p_value"]),
+            lambda df: pd.Series(
+                coint(df["close_1"], df["close_2"])[1], index=["p_value"]
+            ),
             meta={"p_value": pd.Series([], dtype=float)},
         )
 
         with ProgressBar():
             cointegration_p_values_computed = cointegration_p_values.compute()
 
-        logger.info(f"Cointegration analysis complete: {len(cointegration_p_values_computed)} pairs analyzed")
+        logger.info(
+            f"Cointegration analysis complete: {len(cointegration_p_values_computed)} pairs analyzed"
+        )
 
         # Filter for cointegrated pairs
         cointegrated_provider_asset_group_ids = cointegration_p_values_computed.loc[
@@ -467,7 +472,9 @@ def save_pairs_trading_attributes(
                 cointegrated_pairs_trading_stats.compute()
             )
 
-        logger.info(f"Statistics computed for {len(cointegrated_pairs_trading_stats_computed)} cointegrated pairs")
+        logger.info(
+            f"Statistics computed for {len(cointegrated_pairs_trading_stats_computed)} cointegrated pairs"
+        )
 
         # Prepare data for database
         toset = cointegration_p_values_computed.merge(
@@ -508,4 +515,3 @@ def save_pairs_trading_attributes(
         logger.info("Closing cluster...")
         cluster.close(force_shutdown=True)
         logger.info("Analysis complete!")
-

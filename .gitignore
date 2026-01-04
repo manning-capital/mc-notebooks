@@ -22,3 +22,11 @@ wheels/
 *.jsonl.gz
 *.jsonl.bz2
 *.jsonl.xz
+
+# VSCode
+.vscode
+.DS_Store
+
+# Cursor
+.cursor
+.cursorrules
