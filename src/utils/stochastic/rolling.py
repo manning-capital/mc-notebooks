@@ -43,9 +43,6 @@ class RollingOrnsteinUhlenbeckResults:
     theta: NDArray[np.float64]  # 1D array of float64
     sigma: NDArray[np.float64]  # 1D array of float64
     half_life: NDArray[np.float64]  # 1D array of float64
-    entry_level: NDArray[np.float64]  # 1D array of float64
-    exit_level: NDArray[np.float64]  # 1D array of float64
-    loss_level: NDArray[np.float64]  # 1D array of float64
 
 
 def _build_adf_matrices(
@@ -291,14 +288,10 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
         alpha: NDArray[np.float64],
         beta: NDArray[np.float64],
         pvalue: NDArray[np.float64],
-        loss_level: NDArray[np.float64],
         y0: NDArray[np.float64],
         y1: NDArray[np.float64],
         window: int,
-        r: float = 0.0001,
-        c: float = 0.001,
         pvalue_threshold: float = 0.05,
-        trend: Literal["c", "ct", "ctt", "n"] = "c",
         lag: int = 1,
         min_nobs: Optional[int] = None,
         expanding: bool = False,
@@ -307,34 +300,19 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
         self.alpha = alpha
         self.beta = beta
         self.pvalue = pvalue
-        self.loss_level = loss_level
         self.y0 = y0
         self.y1 = y1
         self.window = window
-        self.r = r
-        self.c = c
         self.pvalue_threshold = pvalue_threshold
-        self.trend = trend
         self.lag = lag
         self.min_nobs = min_nobs
         self.expanding = expanding
 
-    def fit(
-        self,
-        method: Literal["inv", "lstsq", "pinv"] = "inv",
-        use_analytical: bool = True,
-    ) -> RollingOrnsteinUhlenbeckResults:
+    def fit(self) -> RollingOrnsteinUhlenbeckResults:
         """
         Fit the rolling Ornstein-Uhlenbeck model.
 
-        Performs rolling OU parameter estimation on spread and computes optimal trading levels.
-
-        Parameters
-        ----------
-        method : {"inv", "lstsq", "pinv"}, default "inv"
-            Method for computing rolling regression parameters.
-        use_analytical : bool, default True
-            If True, use analytical F and G functions for faster level computation.
+        Performs rolling OU parameter estimation on spread.
         """
         # Input validation
         y0 = np.asarray(self.y0, dtype=np.float64).squeeze()
@@ -342,7 +320,6 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
         alpha = np.asarray(self.alpha, dtype=np.float64)
         beta = np.asarray(self.beta, dtype=np.float64)
         pvalue = np.asarray(self.pvalue, dtype=np.float64)
-        loss_level = np.asarray(self.loss_level, dtype=np.float64)
 
         if y0.ndim != 1 or y1.ndim != 1:
             raise ValueError("y0 and y1 must be 1-dimensional")
@@ -356,8 +333,6 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
         theta = np.full(nobs, np.nan)
         sigma = np.full(nobs, np.nan)
         half_life = np.full(nobs, np.nan)
-        entry_level = np.full(nobs, np.nan)
-        exit_level = np.full(nobs, np.nan)
 
         # Determine starting index
         if self.expanding:
@@ -441,59 +416,9 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
             except (np.linalg.LinAlgError, Exception):
                 pass
 
-        # =========================================================================
-        # STAGE 4: Compute optimal entry/exit levels for all valid OU parameters
-        # =========================================================================
-        # Find valid OU parameters (not NaN and positive)
-        valid_mask = (
-            ~np.isnan(mu) & ~np.isnan(theta) & ~np.isnan(sigma) & (mu > 0) & (sigma > 0)
-        )
-
-        if np.any(valid_mask):
-            # Extract valid OU parameters
-            valid_mu = mu[valid_mask]
-            valid_theta = theta[valid_mask]
-            valid_sigma = sigma[valid_mask]
-            valid_L = loss_level[valid_mask]
-
-            # Compute exit levels first (needed for entry levels)
-            try:
-                valid_exit = OrnsteinUhlenbeck.get_optimal_exit_level(
-                    mu=valid_mu,
-                    sigma=valid_sigma,
-                    theta=valid_theta,
-                    r=self.r,
-                    c=self.c,
-                    L=valid_L,
-                    use_analytical=use_analytical,
-                )
-
-                # Compute entry levels (uses exit levels internally)
-                valid_entry = OrnsteinUhlenbeck.get_optimal_entry_level(
-                    mu=valid_mu,
-                    sigma=valid_sigma,
-                    theta=valid_theta,
-                    r=self.r,
-                    c=self.c,
-                    L=valid_L,
-                    b_star=valid_exit,
-                    use_analytical=use_analytical,
-                )
-
-                # Assign back to full arrays
-                exit_level[valid_mask] = valid_exit
-                entry_level[valid_mask] = valid_entry
-
-            except Exception:
-                # If computation fails, leave as NaN
-                pass
-
         return RollingOrnsteinUhlenbeckResults(
             mu=mu,
             theta=theta,
             sigma=sigma,
             half_life=half_life,
-            entry_level=entry_level,
-            exit_level=exit_level,
-            loss_level=loss_level,
         )

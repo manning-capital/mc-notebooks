@@ -4,7 +4,6 @@ Tests for rolling stochastic models: RollingCointegration and RollingOrnsteinUhl
 
 import pytest
 import numpy as np
-from numpy.typing import NDArray
 
 from src.utils.stochastic import (
     RollingCointegration,
@@ -24,9 +23,7 @@ class TestRollingCointegration:
         y0 = np.cumsum(np.random.randn(100) * 0.1)
         y1 = y0 + np.random.randn(100) * 0.5
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=50, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=50, trend="c", lag=1)
 
         assert rolling_coint.y0 is y0
         assert rolling_coint.y1 is y1
@@ -42,9 +39,7 @@ class TestRollingCointegration:
         y0 = np.cumsum(np.random.randn(n) * 0.1)
         y1 = y0 + np.random.randn(n) * 0.5
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=100, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=100, trend="c", lag=1)
 
         results = rolling_coint.fit()
 
@@ -63,9 +58,7 @@ class TestRollingCointegration:
         y0 = np.cumsum(np.random.randn(n) * 0.1)
         y1 = y0 + np.random.randn(n) * 0.5
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=100, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=100, trend="c", lag=1)
 
         results = rolling_coint.fit()
 
@@ -87,9 +80,7 @@ class TestRollingCointegration:
         y0 = np.cumsum(np.random.randn(n) * 0.1)
         y1 = y0 + np.random.randn(n) * 0.5
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=100, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=100, trend="c", lag=1)
 
         results = rolling_coint.fit()
 
@@ -140,9 +131,7 @@ class TestRollingCointegration:
         y0 = np.random.randn(100)
         y1 = np.random.randn(50)  # Different length
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=50, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=50, trend="c", lag=1)
 
         with pytest.raises(ValueError, match="same length"):
             rolling_coint.fit()
@@ -153,9 +142,7 @@ class TestRollingCointegration:
         y0 = np.random.randn(100)
         y1 = np.random.randn(100)
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=5, trend="c", lag=5
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=5, trend="c", lag=5)
 
         with pytest.raises(ValueError, match="window must be at least"):
             rolling_coint.fit()
@@ -171,13 +158,11 @@ class TestRollingOrnsteinUhlenbeck:
         alpha = np.random.randn(n)
         beta = np.ones(n)
         pvalue = np.random.rand(n) * 0.1
-        loss_level = np.random.randn(n)
 
         rolling_ou = RollingOrnsteinUhlenbeck(
             alpha=alpha,
             beta=beta,
             pvalue=pvalue,
-            loss_level=loss_level,
             y0=np.random.randn(n),
             y1=np.random.randn(n),
             window=50,
@@ -186,7 +171,6 @@ class TestRollingOrnsteinUhlenbeck:
         assert rolling_ou.alpha is alpha
         assert rolling_ou.beta is beta
         assert rolling_ou.pvalue is pvalue
-        assert rolling_ou.loss_level is loss_level
 
     def test_inherits_from_ornstein_uhlenbeck(self):
         """Test that RollingOrnsteinUhlenbeck inherits from OrnsteinUhlenbeck."""
@@ -200,7 +184,6 @@ class TestRollingOrnsteinUhlenbeck:
             alpha=np.random.randn(n),
             beta=np.ones(n),
             pvalue=np.random.rand(n) * 0.1,
-            loss_level=np.random.randn(n),
             y0=np.random.randn(n),
             y1=np.random.randn(n),
             window=50,
@@ -229,9 +212,7 @@ class TestRollingOrnsteinUhlenbeck:
         y1 = y0 + np.random.randn(n) * 0.5
 
         # First get cointegration results
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=100, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=100, trend="c", lag=1)
         coint_results = rolling_coint.fit()
 
         # Then fit OU model
@@ -239,27 +220,20 @@ class TestRollingOrnsteinUhlenbeck:
             alpha=coint_results.alpha,
             beta=coint_results.beta,
             pvalue=coint_results.pvalue,
-            loss_level=np.full(n, np.nan),
             y0=y0,
             y1=y1,
             window=100,
-            r=0.0001,
-            c=0.001,
             pvalue_threshold=0.05,
-            trend="c",
             lag=1,
         )
 
-        results = rolling_ou.fit(use_analytical=True)
+        results = rolling_ou.fit()
 
         assert isinstance(results, RollingOrnsteinUhlenbeckResults)
         assert len(results.mu) == n
         assert len(results.theta) == n
         assert len(results.sigma) == n
         assert len(results.half_life) == n
-        assert len(results.entry_level) == n
-        assert len(results.exit_level) == n
-        assert len(results.loss_level) == n
 
     def test_fit_has_valid_results(self):
         """Test that fit produces some valid results."""
@@ -268,23 +242,20 @@ class TestRollingOrnsteinUhlenbeck:
         y0 = np.cumsum(np.random.randn(n) * 0.1)
         y1 = y0 + np.random.randn(n) * 0.5
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=100, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=100, trend="c", lag=1)
         coint_results = rolling_coint.fit()
 
         rolling_ou = RollingOrnsteinUhlenbeck(
             alpha=coint_results.alpha,
             beta=coint_results.beta,
             pvalue=coint_results.pvalue,
-            loss_level=np.full(n, np.nan),
             y0=y0,
             y1=y1,
             window=100,
             pvalue_threshold=0.05,
         )
 
-        results = rolling_ou.fit(use_analytical=True)
+        results = rolling_ou.fit()
 
         # Check that we have some valid windows
         valid = ~np.isnan(results.mu)
@@ -300,9 +271,7 @@ class TestRollingOrnsteinUhlenbeck:
         y0 = np.cumsum(np.random.randn(n) * 0.1)
         y1 = y0 + np.random.randn(n) * 0.5
 
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=100, trend="c", lag=1
-        )
+        rolling_coint = RollingCointegration(y0=y0, y1=y1, window=100, trend="c", lag=1)
         coint_results = rolling_coint.fit()
 
         # Use strict threshold
@@ -310,60 +279,18 @@ class TestRollingOrnsteinUhlenbeck:
             alpha=coint_results.alpha,
             beta=coint_results.beta,
             pvalue=coint_results.pvalue,
-            loss_level=np.full(n, np.nan),
             y0=y0,
             y1=y1,
             window=100,
             pvalue_threshold=0.01,  # Very strict
         )
 
-        results = rolling_ou.fit(use_analytical=True)
+        results = rolling_ou.fit()
 
         # Windows with pvalue > threshold should have NaN OU parameters
         high_pvalue = coint_results.pvalue > 0.01
         if high_pvalue.sum() > 0:
             assert np.all(np.isnan(results.mu[high_pvalue]))
-
-    def test_fit_computes_levels(self):
-        """Test that fit computes entry and exit levels."""
-        np.random.seed(42)
-        n = 300
-        y0 = np.cumsum(np.random.randn(n) * 0.1)
-        y1 = y0 + np.random.randn(n) * 0.5
-
-        rolling_coint = RollingCointegration(
-            y0=y0, y1=y1, window=100, trend="c", lag=1
-        )
-        coint_results = rolling_coint.fit()
-
-        rolling_ou = RollingOrnsteinUhlenbeck(
-            alpha=coint_results.alpha,
-            beta=coint_results.beta,
-            pvalue=coint_results.pvalue,
-            loss_level=np.full(n, np.nan),
-            y0=y0,
-            y1=y1,
-            window=100,
-            pvalue_threshold=0.05,
-        )
-
-        results = rolling_ou.fit(use_analytical=True)
-
-        # Check that levels are present
-        assert hasattr(results, "entry_level")
-        assert hasattr(results, "exit_level")
-        assert hasattr(results, "loss_level")
-
-        # Check that valid OU parameters have levels
-        valid = ~np.isnan(results.mu)
-        if valid.sum() > 0:
-            # Some levels might be NaN if computation fails, but we should have some
-            valid_levels = ~np.isnan(results.entry_level[valid])
-            if valid_levels.sum() > 0:
-                # Entry level should be below theta, exit level above theta
-                valid_idx = np.where(valid)[0][valid_levels][0]
-                assert results.entry_level[valid_idx] < results.theta[valid_idx]
-                assert results.exit_level[valid_idx] > results.theta[valid_idx]
 
     def test_fit_validation_errors(self):
         """Test that fit raises errors for invalid inputs."""
@@ -376,7 +303,6 @@ class TestRollingOrnsteinUhlenbeck:
             alpha=np.random.randn(n),
             beta=np.ones(n),
             pvalue=np.random.rand(n) * 0.1,
-            loss_level=np.random.randn(n),
             y0=y0,
             y1=y1,
             window=50,
@@ -422,13 +348,8 @@ class TestRollingOrnsteinUhlenbeckResults:
             theta=np.zeros(n, dtype=np.float64),
             sigma=np.full(n, 0.1, dtype=np.float64),
             half_life=np.full(n, 1.0, dtype=np.float64),
-            entry_level=np.full(n, -0.1, dtype=np.float64),
-            exit_level=np.full(n, 0.1, dtype=np.float64),
-            loss_level=np.full(n, -0.2, dtype=np.float64),
         )
 
         assert len(results.mu) == n
         assert len(results.theta) == n
         assert results.mu.dtype == np.float64
-        assert results.entry_level.dtype == np.float64
-

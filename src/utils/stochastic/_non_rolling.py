@@ -4,7 +4,227 @@ import statsmodels.api as sm
 from scipy.integrate import quad
 from scipy.special import pbdv, gammaln
 from scipy.stats import norm
-from scipy.optimize import fsolve, brentq
+from typing import Literal
+
+
+def newton_vectorized(
+    f: callable,
+    df_dx: callable,
+    x0: np.ndarray | float,
+    max_iter: int = 20,
+    tol: float = 1e-8,
+    step_direction: float | Literal["positive", "negative"] | None = None,
+) -> np.ndarray | float:
+    """
+    Vectorized Newton's method for root finding.
+
+    Parameters
+    ----------
+    f : callable
+        Function f(x) to find roots of. Should accept array x and return array of same shape.
+    df_dx : callable
+        Derivative function df/dx. Should accept array x and return array of same shape.
+    x0 : np.ndarray or float
+        Initial guess(es) for the root(s)
+    max_iter : int, optional
+        Maximum number of iterations (default: 20)
+    tol : float, optional
+        Tolerance for convergence (default: 1e-8)
+    step_direction : float, str, or None, optional
+        Direction to move in terms of the derivative from the initial guess.
+        - If None or "auto": Standard Newton direction (x - dx)
+        - If float: Multiplier for the step direction. x = x - step_direction * dx
+          - 1.0: Standard Newton (default behavior)
+          - -1.0: Reverse direction
+          - 0.5: Take smaller steps
+        - If "positive": Move in positive direction when derivative is positive,
+          negative direction when derivative is negative (x = x - sign(fpx) * dx)
+        - If "negative": Move in negative direction when derivative is positive,
+          positive direction when derivative is negative (x = x + sign(fpx) * dx)
+
+    Returns
+    -------
+    np.ndarray or float
+        Root(s) found by Newton's method. Returns scalar if input was scalar.
+    """
+    # Convert to array and remember if input was scalar
+    x0_arr = np.asarray(x0)
+    was_scalar = x0_arr.ndim == 0
+    if was_scalar:
+        x0_arr = x0_arr.reshape(1)
+
+    x = x0_arr.copy()
+
+    # Determine step direction multiplier
+    if step_direction is None or step_direction == "auto":
+        direction_mult = 1.0
+    elif isinstance(step_direction, (int, float)):
+        direction_mult = float(step_direction)
+    elif step_direction == "positive":
+        # Move in positive direction based on derivative sign
+        # When f'(x) > 0, move in positive direction; when f'(x) < 0, move in negative direction
+        direction_mult = None  # Will be set dynamically
+    elif step_direction == "negative":
+        # Move in negative direction based on derivative sign
+        # When f'(x) > 0, move in negative direction; when f'(x) < 0, move in positive direction
+        direction_mult = None  # Will be set dynamically
+    else:
+        raise ValueError(
+            f"step_direction must be None, 'auto', a float, 'positive', or 'negative', got {step_direction}"
+        )
+
+    for _ in range(max_iter):
+        fx = f(x)
+        fpx = df_dx(x)
+
+        # Ensure fx and fpx are arrays with same shape as x
+        fx = np.asarray(fx)
+        fpx = np.asarray(fpx)
+        if fx.shape != x.shape:
+            fx = np.broadcast_to(fx, x.shape)
+        if fpx.shape != x.shape:
+            fpx = np.broadcast_to(fpx, x.shape)
+
+        # Avoid division by zero
+        mask = np.abs(fpx) > 1e-12
+        dx = np.zeros_like(x)
+        dx[mask] = fx[mask] / fpx[mask]
+
+        # Determine step direction multiplier for this iteration
+        if direction_mult is None:
+            if step_direction == "positive":
+                # Move in direction of increasing x when derivative is positive
+                # This means: if f'(x) > 0, use positive step; if f'(x) < 0, use negative step
+                # Standard Newton is x = x - f/f', so we want to reverse when f' < 0
+                current_direction = np.where(fpx > 0, 1.0, -1.0)
+            elif step_direction == "negative":
+                # Move in direction of decreasing x when derivative is positive
+                # This means: if f'(x) > 0, use negative step; if f'(x) < 0, use positive step
+                current_direction = np.where(fpx > 0, -1.0, 1.0)
+            else:
+                current_direction = 1.0
+        else:
+            current_direction = direction_mult
+
+        # Ensure current_direction is properly shaped
+        if isinstance(current_direction, np.ndarray):
+            if current_direction.shape != x.shape:
+                current_direction = np.broadcast_to(current_direction, x.shape)
+        else:
+            # Scalar - broadcast to x.shape
+            current_direction = np.full(x.shape, current_direction)
+
+        x = x - current_direction * dx
+
+        # Check convergence
+        step_size = np.abs(current_direction * dx)
+        if np.max(step_size) < tol:
+            break
+
+    # Return scalar if input was scalar
+    if was_scalar:
+        return float(x.item())
+    return x
+
+
+def newton_with_multiple_guesses(
+    f: callable,
+    df_dx: callable,
+    guesses: np.ndarray,
+    max_iter: int = 20,
+    tol: float = 1e-8,
+    valid_range: tuple = (None, None),
+) -> np.ndarray:
+    """
+    Newton's method with multiple initial guesses, returning the best result.
+
+    Tries each guess and selects the one with the smallest residual |f(x)|.
+    Only considers results within the valid_range if provided.
+
+    Parameters
+    ----------
+    f : callable
+        Function f(x) to find roots of (expects array input matching guesses[0].shape)
+    df_dx : callable
+        Derivative function df/dx (expects array input matching guesses[0].shape)
+    guesses : np.ndarray
+        Array of initial guesses to try (shape: [n_guesses, ...])
+    max_iter : int, optional
+        Maximum number of iterations per guess (default: 20)
+    tol : float, optional
+        Tolerance for convergence (default: 1e-8)
+    valid_range : tuple, optional
+        (lower_bound, upper_bound) for valid results. None means no bound.
+        Only results in this range are considered. Default: (None, None)
+
+    Returns
+    -------
+    np.ndarray
+        Best root found (shape matches guesses[0])
+    """
+    n_guesses = guesses.shape[0]
+    target_shape = guesses.shape[1:]
+    results = np.zeros_like(guesses[0])
+    residuals = np.full(target_shape, np.inf)
+
+    lower_bound, upper_bound = valid_range
+    if lower_bound is not None:
+        lower_bound = np.asarray(lower_bound)
+        if lower_bound.shape != target_shape:
+            lower_bound = np.broadcast_to(lower_bound, target_shape)
+    if upper_bound is not None:
+        upper_bound = np.asarray(upper_bound)
+        if upper_bound.shape != target_shape:
+            upper_bound = np.broadcast_to(upper_bound, target_shape)
+
+    # Try each guess
+    for i in range(n_guesses):
+        try:
+            guess = guesses[i]
+            # Run Newton's method with this guess
+            result = newton_vectorized(f, df_dx, guess, max_iter=max_iter, tol=tol)
+
+            # Ensure result is properly shaped
+            result = np.asarray(result)
+            if result.shape != target_shape:
+                if result.ndim == 0:
+                    # Scalar - broadcast to target shape
+                    result = np.full(target_shape, result.item())
+                else:
+                    result = np.broadcast_to(result, target_shape)
+
+            # Check if result is in valid range
+            valid_mask = np.ones(target_shape, dtype=bool)
+            if lower_bound is not None:
+                valid_mask = valid_mask & (result > lower_bound)
+            if upper_bound is not None:
+                valid_mask = valid_mask & (result < upper_bound)
+
+            # Only evaluate residual for valid results
+            if np.any(valid_mask):
+                # Evaluate function at result to get residual
+                fx = f(result)
+                fx = np.asarray(fx)
+                if fx.shape != target_shape:
+                    fx = np.broadcast_to(fx, target_shape)
+                residual = np.abs(fx)
+
+                # Only update where result is valid AND gives a better residual
+                better_mask = valid_mask & (residual < residuals)
+                results[better_mask] = result[better_mask]
+                residuals[better_mask] = residual[better_mask]
+
+        except Exception:
+            # If this guess fails, continue to next guess
+            continue
+
+    # If all guesses failed (all residuals still inf), use first guess as fallback
+    failed_mask = np.isinf(residuals)
+    if np.any(failed_mask):
+        results[failed_mask] = guesses[0][failed_mask]
+
+    return results
+
 
 from .base import (
     DELTA_T,
@@ -728,6 +948,97 @@ class OrnsteinUhlenbeck(StochasticModel):
         ) / h
 
     @staticmethod
+    def V(
+        x: float | np.ndarray,
+        mu: float | np.ndarray,
+        sigma: float | np.ndarray,
+        theta: float | np.ndarray,
+        r: float | np.ndarray,
+        c: float | np.ndarray,
+        exit_level: float | np.ndarray,
+        use_analytical: bool = False,
+    ) -> float | np.ndarray:
+        """
+        The value function V(x, r).
+        """
+        # Convert to arrays and broadcast to same shape
+        x_arr = np.atleast_1d(x)
+        mu_arr = np.atleast_1d(mu)
+        sigma_arr = np.atleast_1d(sigma)
+        theta_arr = np.atleast_1d(theta)
+        r_arr = np.atleast_1d(r)
+        c_arr = np.atleast_1d(c)
+        exit_level_arr = np.atleast_1d(exit_level)
+
+        # Broadcast all arrays to the same shape
+        x_arr, mu_arr, sigma_arr, theta_arr, r_arr, c_arr, exit_level_arr = (
+            np.broadcast_arrays(
+                x_arr, mu_arr, sigma_arr, theta_arr, r_arr, c_arr, exit_level_arr
+            )
+        )
+
+        # Create masks for element-wise operations
+        left_mask = x_arr < exit_level_arr
+
+        # Compute V_left for all elements (will be used where left_mask is True)
+        F_x = OrnsteinUhlenbeck.F(
+            x_arr, mu_arr, sigma_arr, theta_arr, r_arr, use_analytical=use_analytical
+        )
+        F_exit = OrnsteinUhlenbeck.F(
+            exit_level_arr,
+            mu_arr,
+            sigma_arr,
+            theta_arr,
+            r_arr,
+            use_analytical=use_analytical,
+        )
+        V_left = (exit_level_arr - c_arr) * F_x / F_exit
+
+        # Compute V_right for all elements (will be used where left_mask is False)
+        V_right = x_arr - c_arr
+
+        # Use np.where for element-wise selection
+        result = np.where(left_mask, V_left, V_right)
+
+        # Return scalar if input was scalar
+        if (
+            np.isscalar(x)
+            and np.isscalar(mu)
+            and np.isscalar(sigma)
+            and np.isscalar(theta)
+            and np.isscalar(r)
+            and np.isscalar(c)
+            and np.isscalar(exit_level)
+        ):
+            return float(result)
+
+        return result
+
+    @staticmethod
+    def V_prime(
+        x: float | np.ndarray,
+        mu: float | np.ndarray,
+        sigma: float | np.ndarray,
+        theta: float | np.ndarray,
+        r: float | np.ndarray,
+        c: float | np.ndarray,
+        exit_level: float | np.ndarray,
+        h: float = 1e-6,
+        use_analytical: bool = False,
+    ) -> float | np.ndarray:
+        """
+        The derivative of the value function V(x, r).
+        """
+        return (
+            OrnsteinUhlenbeck.V(
+                x + h, mu, sigma, theta, r, c, exit_level, use_analytical=use_analytical
+            )
+            - OrnsteinUhlenbeck.V(
+                x - h, mu, sigma, theta, r, c, exit_level, use_analytical=use_analytical
+            )
+        ) / (2 * h)
+
+    @staticmethod
     def C(
         c: float | np.ndarray,
         mu: float | np.ndarray,
@@ -735,7 +1046,7 @@ class OrnsteinUhlenbeck(StochasticModel):
         theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
-        b_star: float | np.ndarray,
+        exit_level: float | np.ndarray,
         use_analytical: bool = False,
     ) -> float | np.ndarray:
         """
@@ -755,7 +1066,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             Discount rate
         L : float or ndarray
             Loss level parameter(s)
-        b_star : float or ndarray
+        exit_level : float or ndarray
             Optimal exit level parameter(s)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
@@ -767,13 +1078,13 @@ class OrnsteinUhlenbeck(StochasticModel):
             determined by broadcasting the input arrays
         """
         return (
-            (b_star - c)
+            (exit_level - c)
             * OrnsteinUhlenbeck.G(
                 L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
             )
             - (L - c)
             * OrnsteinUhlenbeck.G(
-                b_star,
+                exit_level,
                 mu=mu,
                 sigma=sigma,
                 theta=theta,
@@ -782,7 +1093,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             )
         ) / (
             OrnsteinUhlenbeck.F(
-                b_star,
+                exit_level,
                 mu=mu,
                 sigma=sigma,
                 theta=theta,
@@ -796,7 +1107,7 @@ class OrnsteinUhlenbeck(StochasticModel):
                 L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
             )
             * OrnsteinUhlenbeck.G(
-                b_star,
+                exit_level,
                 mu=mu,
                 sigma=sigma,
                 theta=theta,
@@ -813,7 +1124,7 @@ class OrnsteinUhlenbeck(StochasticModel):
         theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
-        b_star: float | np.ndarray,
+        exit_level: float | np.ndarray,
         use_analytical: bool = False,
     ) -> float | np.ndarray:
         """
@@ -833,7 +1144,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             Discount rate
         L : float or ndarray
             Loss level parameter(s)
-        b_star : float or ndarray
+        exit_level : float or ndarray
             Optimal exit level parameter(s)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
@@ -847,20 +1158,20 @@ class OrnsteinUhlenbeck(StochasticModel):
         return (
             (L - c)
             * OrnsteinUhlenbeck.F(
-                b_star,
+                exit_level,
                 mu=mu,
                 sigma=sigma,
                 theta=theta,
                 r=r,
                 use_analytical=use_analytical,
             )
-            - (b_star - c)
+            - (exit_level - c)
             * OrnsteinUhlenbeck.F(
                 L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
             )
         ) / (
             OrnsteinUhlenbeck.F(
-                b_star,
+                exit_level,
                 mu=mu,
                 sigma=sigma,
                 theta=theta,
@@ -874,7 +1185,7 @@ class OrnsteinUhlenbeck(StochasticModel):
                 L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
             )
             * OrnsteinUhlenbeck.G(
-                b_star,
+                exit_level,
                 mu=mu,
                 sigma=sigma,
                 theta=theta,
@@ -884,7 +1195,7 @@ class OrnsteinUhlenbeck(StochasticModel):
         )
 
     @staticmethod
-    def V(
+    def V_L(
         x: float | np.ndarray,
         c: float | np.ndarray,
         mu: float | np.ndarray,
@@ -892,11 +1203,11 @@ class OrnsteinUhlenbeck(StochasticModel):
         theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
-        b_star: float | np.ndarray,
+        exit_level: float | np.ndarray,
         use_analytical: bool = False,
     ) -> float | np.ndarray:
         """
-        The value function V(x, r).
+        The value function V_L(x, r).
 
         Parameters
         ----------
@@ -914,7 +1225,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             Discount rate
         L : float or ndarray
             Loss level parameter(s)
-        b_star : float or ndarray
+        exit_level : float or ndarray
             Optimal exit level parameter(s)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
@@ -932,17 +1243,17 @@ class OrnsteinUhlenbeck(StochasticModel):
         sigma_arr = np.atleast_1d(sigma)
         theta_arr = np.atleast_1d(theta)
         L_arr = np.atleast_1d(L)
-        b_star_arr = np.atleast_1d(b_star)
+        exit_level_arr = np.atleast_1d(exit_level)
 
         # Broadcast all arrays to the same shape
-        x_arr, c_arr, mu_arr, sigma_arr, theta_arr, L_arr, b_star_arr = (
+        x_arr, c_arr, mu_arr, sigma_arr, theta_arr, L_arr, exit_level_arr = (
             np.broadcast_arrays(
-                x_arr, c_arr, mu_arr, sigma_arr, theta_arr, L_arr, b_star_arr
+                x_arr, c_arr, mu_arr, sigma_arr, theta_arr, L_arr, exit_level_arr
             )
         )
 
-        # Element-wise condition: x < b_star and x > L
-        condition = (x_arr < b_star_arr) & (x_arr > L_arr)
+        # Element-wise condition: x < exit_level and x > L
+        condition = (x_arr < exit_level_arr) & (x_arr > L_arr)
 
         # Compute both branches
         waiting_value = OrnsteinUhlenbeck.C(
@@ -952,7 +1263,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             theta=theta_arr,
             r=r,
             L=L_arr,
-            b_star=b_star_arr,
+            exit_level=exit_level_arr,
             use_analytical=use_analytical,
         ) * OrnsteinUhlenbeck.F(
             x_arr,
@@ -968,7 +1279,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             theta=theta_arr,
             r=r,
             L=L_arr,
-            b_star=b_star_arr,
+            exit_level=exit_level_arr,
             use_analytical=use_analytical,
         ) * OrnsteinUhlenbeck.G(
             x_arr,
@@ -991,14 +1302,14 @@ class OrnsteinUhlenbeck(StochasticModel):
             and np.isscalar(sigma)
             and np.isscalar(theta)
             and np.isscalar(L)
-            and np.isscalar(b_star)
+            and np.isscalar(exit_level)
         ):
             return float(result)
 
         return result
 
     @staticmethod
-    def V_prime(
+    def V_L_prime(
         x: float | np.ndarray,
         c: float | np.ndarray,
         mu: float | np.ndarray,
@@ -1006,14 +1317,14 @@ class OrnsteinUhlenbeck(StochasticModel):
         theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
-        b_star: float | np.ndarray,
+        exit_level: float | np.ndarray,
         h: float = 1e-6,
         use_analytical: bool = False,
     ) -> float | np.ndarray:
         """
-        The derivative of the value function V(x, r).
+        The derivative of the value function V_L(x, r).
 
-        Uses finite difference approximation: (V(x+h) - V(x)) / h
+        Uses finite difference approximation: (V_L(x+h) - V_L(x)) / h
 
         Parameters
         ----------
@@ -1031,7 +1342,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             Discount rate
         L : float or ndarray
             Loss level parameter(s)
-        b_star : float or ndarray
+        exit_level : float or ndarray
             Optimal exit level parameter(s)
         h : float, optional
             Step size for finite difference (default: 1e-6)
@@ -1045,7 +1356,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             determined by broadcasting the input arrays
         """
         return (
-            OrnsteinUhlenbeck.V(
+            OrnsteinUhlenbeck.V_L(
                 x + h,
                 c=c,
                 mu=mu,
@@ -1053,10 +1364,10 @@ class OrnsteinUhlenbeck(StochasticModel):
                 theta=theta,
                 r=r,
                 L=L,
-                b_star=b_star,
+                exit_level=exit_level,
                 use_analytical=use_analytical,
             )
-            - OrnsteinUhlenbeck.V(
+            - OrnsteinUhlenbeck.V_L(
                 x,
                 c=c,
                 mu=mu,
@@ -1064,134 +1375,10 @@ class OrnsteinUhlenbeck(StochasticModel):
                 theta=theta,
                 r=r,
                 L=L,
-                b_star=b_star,
+                exit_level=exit_level,
                 use_analytical=use_analytical,
             )
         ) / h
-
-    @staticmethod
-    def _find_root_grid(
-        f_func,
-        search_low: np.ndarray,
-        search_high: np.ndarray,
-        n_grid: int = 50,
-        use_brentq: bool = True,
-    ) -> np.ndarray:
-        """
-        Find roots using a grid-based approach to find brackets, then brentq for refinement.
-
-        Parameters
-        ----------
-        f_func : callable
-            Function that takes a 2D array (n_elements, n_grid) and returns
-            function values of shape (n_elements, n_grid)
-        search_low : ndarray
-            Lower bounds for search, shape (n_elements,)
-        search_high : ndarray
-            Upper bounds for search, shape (n_elements,)
-        n_grid : int, optional
-            Number of grid points for bracket finding (default: 50)
-        use_brentq : bool, optional
-            If True, use brentq to refine roots (default: True)
-
-        Returns
-        -------
-        ndarray
-            Root values, shape (n_elements,)
-        """
-        n_elements = search_low.shape[0]
-
-        # Create a scalar function wrapper for each element
-        # We need to create element-specific functions for brentq
-        def create_element_func(i):
-            """Create a function for element i that can be used with brentq"""
-
-            def element_f(x):
-                # Create a grid with just this one value for this element
-                # We need to create a full grid but only evaluate at the right position
-                grid_single = np.zeros((n_elements, 1))
-                grid_single[i, 0] = float(x)
-                # Evaluate only for this element's grid
-                result = f_func(grid_single)
-                return float(result[i, 0])
-
-            return element_f
-
-        # Create grid for all elements to find brackets
-        # Shape: (n_elements, n_grid)
-        grid = np.array(
-            [
-                np.linspace(search_low[i], search_high[i], n_grid)
-                for i in range(n_elements)
-            ]
-        )
-
-        # Evaluate function at all grid points (vectorized)
-        # Shape: (n_elements, n_grid)
-        f_values = f_func(grid)
-
-        # Ensure f_values has correct shape
-        if f_values.shape != (n_elements, n_grid):
-            raise ValueError(
-                f"f_func returned shape {f_values.shape}, expected ({n_elements}, {n_grid})"
-            )
-
-        # Find zero crossings for each element
-        roots = np.full(n_elements, np.nan)
-
-        for i in range(n_elements):
-            f_vals = np.asarray(f_values[i, :]).flatten()
-            grid_vals = np.asarray(grid[i, :]).flatten()
-
-            # Find sign changes
-            signs = np.sign(f_vals)
-            sign_changes = np.where(np.diff(signs) != 0)[0]
-
-            if len(sign_changes) > 0:
-                # Use first sign change as bracket
-                idx = int(sign_changes[0])
-                bracket_low = float(grid_vals[idx])
-                bracket_high = float(grid_vals[idx + 1])
-
-                if use_brentq:
-                    # Use brentq to find precise root in bracket
-                    try:
-                        element_f = create_element_func(i)
-                        root = brentq(
-                            element_f, bracket_low, bracket_high, xtol=1e-8, maxiter=100
-                        )
-                        roots[i] = root
-                    except (ValueError, RuntimeError):
-                        # Fallback to linear interpolation if brentq fails
-                        f1, f2 = float(f_vals[idx]), float(f_vals[idx + 1])
-                        if abs(f2 - f1) > 1e-15:
-                            root = bracket_low - f1 * (bracket_high - bracket_low) / (
-                                f2 - f1
-                            )
-                        else:
-                            root = (bracket_low + bracket_high) / 2
-                        roots[i] = root
-                else:
-                    # Linear interpolation
-                    f1, f2 = float(f_vals[idx]), float(f_vals[idx + 1])
-                    if abs(f2 - f1) > 1e-15:
-                        root = bracket_low - f1 * (bracket_high - bracket_low) / (
-                            f2 - f1
-                        )
-                    else:
-                        root = (bracket_low + bracket_high) / 2
-                    roots[i] = root
-            else:
-                # No sign change found, use point closest to zero
-                abs_f_vals = np.abs(f_vals)
-                # Handle NaN/inf values
-                abs_f_vals = np.where(np.isfinite(abs_f_vals), abs_f_vals, np.inf)
-                min_idx = int(np.argmin(abs_f_vals))
-                # Ensure index is valid
-                min_idx = max(0, min(min_idx, len(grid_vals) - 1))
-                roots[i] = float(grid_vals[min_idx])
-
-        return roots
 
     @staticmethod
     def get_optimal_exit_level(
@@ -1201,13 +1388,11 @@ class OrnsteinUhlenbeck(StochasticModel):
         r: float = 0.01,
         c: float | np.ndarray = 0.001,
         L: Optional[float | np.ndarray] = None,
-        h: float = 1e-6,
-        initial_guess: Optional[float | np.ndarray] = None,
         use_analytical: bool = False,
     ) -> float | np.ndarray:
         """
-        Computes the optimal exit level (b_star) for an OU process.
-        Uses Brent's method (brentq) for root finding.
+        Computes the optimal exit level (exit_level) for an OU process.
+        Uses Newton's method for root finding.
 
         Parameters
         ----------
@@ -1223,17 +1408,13 @@ class OrnsteinUhlenbeck(StochasticModel):
             Transaction cost to enter the trade (default: 0.001)
         L : float or ndarray, optional
             Loss level to exit the trade. If None, defaults to theta - 2*sigma (default: None)
-        h : float, optional
-            Step size for numerical differentiation (default: 1e-6)
-        initial_guess : float or ndarray, optional
-            Starting point for root finding. If None, defaults to theta + 0.1*sigma (default: None)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
 
         Returns
         -------
         float or ndarray
-            Optimal exit level (b_star) - should be well above theta.
+            Optimal exit level (exit_level) - should be well above theta.
             Scalar if all inputs are scalar, otherwise array with shape
             determined by broadcasting the input arrays
         """
@@ -1255,141 +1436,87 @@ class OrnsteinUhlenbeck(StochasticModel):
             L_arr = np.atleast_1d(L) if not np.isscalar(L) else np.array([L])
             L_arr = np.broadcast_to(L_arr, mu_arr.shape)
 
-        # Handle initial_guess
-        if initial_guess is None:
-            initial_guess_arr = theta_arr + 0.1 * sigma_arr
-        else:
-            initial_guess_arr = (
-                np.atleast_1d(initial_guess)
-                if not np.isscalar(initial_guess)
-                else np.array([initial_guess])
+        # Choose initial guess
+        initial_guess_arr = theta_arr + 10 * sigma_arr
+
+        # Pre-compute L-dependent values (constant for all elements)
+        F_L = OrnsteinUhlenbeck.F(
+            L_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
+        )
+        G_L = OrnsteinUhlenbeck.G(
+            L_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
+        )
+        # Ensure F_L and G_L are arrays with correct shape
+        F_L = np.asarray(F_L)
+        G_L = np.asarray(G_L)
+        if F_L.shape != mu_arr.shape:
+            F_L = np.broadcast_to(F_L, mu_arr.shape)
+        if G_L.shape != mu_arr.shape:
+            G_L = np.broadcast_to(G_L, mu_arr.shape)
+
+        # Define vectorized function to find root of: f(b) = f_left - f_right
+        def f_exit(b: float | np.ndarray, h: float = 1e-6) -> float | np.ndarray:
+            # Ensure b is properly shaped and broadcast with other arrays
+            b_arr = np.asarray(b)
+            if b_arr.shape != mu_arr.shape:
+                # Broadcast b to match mu_arr shape
+                b_arr = np.broadcast_to(b_arr, mu_arr.shape)
+
+            G_b = OrnsteinUhlenbeck.G(
+                b_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
             )
-            initial_guess_arr = np.broadcast_to(initial_guess_arr, mu_arr.shape)
-
-        # Process each element using brentq
-        n_elements = mu_arr.size
-        result = np.empty(mu_arr.shape, dtype=float)
-
-        # Flatten for iteration
-        mu_flat = mu_arr.flatten()
-        sigma_flat = sigma_arr.flatten()
-        theta_flat = theta_arr.flatten()
-        c_flat = c_arr.flatten()
-        L_flat = L_arr.flatten()
-        initial_guess_flat = initial_guess_arr.flatten()
-
-        for idx in np.ndindex(mu_arr.shape):
-            i = np.ravel_multi_index(idx, mu_arr.shape)
-            mu_val = float(mu_flat[i])
-            sigma_val = float(sigma_flat[i])
-            theta_val = float(theta_flat[i])
-            c_val = float(c_flat[i])
-            L_val = float(L_flat[i])
-            initial_guess_val = float(initial_guess_flat[i])
-
-            # Pre-compute L-dependent values (constant for this element)
-            F_L = OrnsteinUhlenbeck.F(
-                L_val, mu_val, sigma_val, theta_val, r, use_analytical=use_analytical
+            F_prime_b = OrnsteinUhlenbeck.F_prime(
+                b_arr,
+                mu_arr,
+                sigma_arr,
+                theta_arr,
+                r,
+                h=h,
+                use_analytical=use_analytical,
             )
-            G_L = OrnsteinUhlenbeck.G(
-                L_val, mu_val, sigma_val, theta_val, r, use_analytical=use_analytical
+            F_b = OrnsteinUhlenbeck.F(
+                b_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
+            )
+            G_prime_b = OrnsteinUhlenbeck.G_prime(
+                b_arr,
+                mu_arr,
+                sigma_arr,
+                theta_arr,
+                r,
+                h=h,
+                use_analytical=use_analytical,
             )
 
-            # Define the function to find root of
-            def f(b):
-                b_val = float(b)
-                G_b = OrnsteinUhlenbeck.G(
-                    b_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    use_analytical=use_analytical,
-                )
-                F_prime_b = OrnsteinUhlenbeck.F_prime(
-                    b_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    h=h,
-                    use_analytical=use_analytical,
-                )
-                F_b = OrnsteinUhlenbeck.F(
-                    b_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    use_analytical=use_analytical,
-                )
-                G_prime_b = OrnsteinUhlenbeck.G_prime(
-                    b_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    h=h,
-                    use_analytical=use_analytical,
-                )
+            f_left = ((L_arr - c_arr) * G_b - (b_arr - c_arr) * F_prime_b) + (
+                (b_arr - c_arr) * F_L - (L_arr - c_arr) * F_b
+            ) * G_prime_b
 
-                f_left = ((L_val - c_val) * G_b - (b_val - c_val) * F_prime_b) + (
-                    (b_val - c_val) * F_L - (L_val - c_val) * F_b
-                ) * G_prime_b
+            f_right = G_b * F_L - G_L * F_b
 
-                f_right = G_b * F_L - G_L * F_b
+            return f_left - f_right
 
-                return f_left - f_right
+        # Define vectorized derivative using numerical differentiation
+        def df_exit_dx(b: float | np.ndarray, h: float = 1e-6) -> float | np.ndarray:
+            b_arr = np.asarray(b)
+            if b_arr.shape != mu_arr.shape:
+                b_arr = np.broadcast_to(b_arr, mu_arr.shape)
+            return (f_exit(b_arr + h, h) - f_exit(b_arr - h, h)) / (2 * h)
 
-            # Define search bounds
-            bracket_low = max(theta_val + 0.001, L_val + 0.001, theta_val + 0.01)
-            bracket_high = min(theta_val + 2 * sigma_val, theta_val + 0.5 * sigma_val)
+        # Use Newton's method to find result
+        # Exit level must be > theta
+        result = newton_vectorized(
+            f_exit,
+            df_exit_dx,
+            initial_guess_arr,
+            max_iter=50,
+            tol=1e-8,
+            step_direction="negative",
+        )
 
-            # Try multiple bracket ranges
-            bracket_ranges = [
-                (theta_val + 0.01, theta_val + 0.05),
-                (theta_val + 0.05, theta_val + 0.15),
-                (theta_val + 0.1 * sigma_val, theta_val + 0.3 * sigma_val),
-                (bracket_low, bracket_high),
-            ]
-
-            found = False
-            for br_low, br_high in bracket_ranges:
-                br_low = max(br_low, theta_val + 0.001, L_val + 0.001)
-                br_high = min(br_high, theta_val + 2 * sigma_val)
-
-                if br_low >= br_high:
-                    continue
-
-                # Check if bracket has opposite signs
-                f_low = f(br_low)
-                f_high = f(br_high)
-
-                if f_low * f_high < 0:
-                    try:
-                        b_result = brentq(f, br_low, br_high, xtol=1e-8, maxiter=100)
-                        if (
-                            b_result > theta_val
-                            and b_result > L_val
-                            and b_result < theta_val + 2 * sigma_val
-                        ):
-                            result[idx] = b_result
-                            found = True
-                            break
-                    except (ValueError, RuntimeError):
-                        continue
-
-            if not found:
-                # Fallback: use fsolve with initial guess
-                try:
-                    b_result = fsolve(f, initial_guess_val, xtol=1e-8, maxfev=200)[0]
-                    result[idx] = max(
-                        min(b_result, theta_val + 2 * sigma_val),
-                        theta_val + 0.01,
-                        L_val + 0.01,
-                    )
-                except:
-                    result[idx] = initial_guess_val
+        # Ensure result is properly shaped
+        result = np.asarray(result)
+        if result.shape != mu_arr.shape:
+            result = np.broadcast_to(result, mu_arr.shape)
 
         # Return scalar if input was scalar
         if (
@@ -1398,8 +1525,10 @@ class OrnsteinUhlenbeck(StochasticModel):
             and np.isscalar(theta)
             and np.isscalar(c)
             and (L is None or np.isscalar(L))
-            and (initial_guess is None or np.isscalar(initial_guess))
         ):
+            # Extract single element before converting to float
+            if isinstance(result, np.ndarray):
+                return float(result.item())
             return float(result)
 
         return result
@@ -1414,12 +1543,12 @@ class OrnsteinUhlenbeck(StochasticModel):
         L: Optional[float | np.ndarray] = None,
         h: float = 1e-6,
         initial_guess: Optional[float | np.ndarray] = None,
-        b_star: Optional[float | np.ndarray] = None,
+        exit_level: Optional[float | np.ndarray] = None,
         use_analytical: bool = False,
     ) -> float | np.ndarray:
         """
         Computes the optimal entry level (d_star) for an OU process.
-        Uses Brent's method (brentq) for root finding.
+        Uses Newton's method for root finding.
 
         Parameters
         ----------
@@ -1437,9 +1566,12 @@ class OrnsteinUhlenbeck(StochasticModel):
             Loss level to exit the trade. If None, defaults to theta - 2*sigma (default: None)
         h : float, optional
             Step size for numerical differentiation (default: 1e-6)
-        initial_guess : float or ndarray, optional
-            Starting point for root finding. If None, defaults to (L + theta) / 2 (default: None)
-        b_star : float or ndarray, optional
+        initial_guess : ndarray, optional
+            Starting point(s) for root finding. Should be a vector of the same length/shape as
+            the broadcasted mu, sigma, and theta arrays. Each element will be used as the initial
+            guess for the corresponding parameter set. If None, defaults to multiple guesses
+            based on L and theta (default: None)
+        exit_level : float or ndarray, optional
             Pre-computed optimal exit level. If None, will be computed (default: None)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
@@ -1469,9 +1601,9 @@ class OrnsteinUhlenbeck(StochasticModel):
             L_arr = np.atleast_1d(L) if not np.isscalar(L) else np.array([L])
             L_arr = np.broadcast_to(L_arr, mu_arr.shape)
 
-        # Get b_star first (needed for d_star calculation) if not provided
-        if b_star is None:
-            b_star_arr = OrnsteinUhlenbeck.get_optimal_exit_level(
+        # Get exit_level first (needed for d_star calculation) if not provided
+        if exit_level is None:
+            exit_level_arr = OrnsteinUhlenbeck.get_optimal_exit_level(
                 mu=mu_arr,
                 sigma=sigma_arr,
                 theta=theta_arr,
@@ -1481,137 +1613,137 @@ class OrnsteinUhlenbeck(StochasticModel):
                 h=h,
                 use_analytical=use_analytical,
             )
-            b_star_arr = np.atleast_1d(b_star_arr)
+            exit_level_arr = np.atleast_1d(exit_level_arr)
         else:
-            b_star_arr = (
-                np.atleast_1d(b_star) if not np.isscalar(b_star) else np.array([b_star])
+            exit_level_arr = (
+                np.atleast_1d(exit_level)
+                if not np.isscalar(exit_level)
+                else np.array([exit_level])
             )
-            b_star_arr = np.broadcast_to(b_star_arr, mu_arr.shape)
+            exit_level_arr = np.broadcast_to(exit_level_arr, mu_arr.shape)
 
         # Handle initial_guess
+        # Entry level should be between L and theta
         if initial_guess is None:
-            initial_guess_arr = (L_arr + theta_arr) / 2
+            # Default guess: middle of [L, theta]
+            range_size = theta_arr - L_arr
+            initial_guess_arr = L_arr + 0.5 * range_size
         else:
-            initial_guess_arr = (
-                np.atleast_1d(initial_guess)
-                if not np.isscalar(initial_guess)
-                else np.array([initial_guess])
-            )
-            initial_guess_arr = np.broadcast_to(initial_guess_arr, mu_arr.shape)
-
-        # Process each element using brentq
-        n_elements = mu_arr.size
-        result = np.empty(mu_arr.shape, dtype=float)
-
-        # Flatten for iteration
-        mu_flat = mu_arr.flatten()
-        sigma_flat = sigma_arr.flatten()
-        theta_flat = theta_arr.flatten()
-        c_flat = c_arr.flatten()
-        L_flat = L_arr.flatten()
-        b_star_flat = b_star_arr.flatten()
-        initial_guess_flat = initial_guess_arr.flatten()
-
-        for idx in np.ndindex(mu_arr.shape):
-            i = np.ravel_multi_index(idx, mu_arr.shape)
-            mu_val = float(mu_flat[i])
-            sigma_val = float(sigma_flat[i])
-            theta_val = float(theta_flat[i])
-            c_val = float(c_flat[i])
-            L_val = float(L_flat[i])
-            b_star_val = float(b_star_flat[i])
-            initial_guess_val = float(initial_guess_flat[i])
-
-            # Define the function to find root of
-            def f(d):
-                d_val = float(d)
-                G_d = OrnsteinUhlenbeck.G(
-                    d_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    use_analytical=use_analytical,
-                )
-                V_prime_d = OrnsteinUhlenbeck.V_prime(
-                    d_val,
-                    c_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    L_val,
-                    b_star_val,
-                    h,
-                    use_analytical=use_analytical,
-                )
-                G_prime_d = OrnsteinUhlenbeck.G_prime(
-                    d_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    h=h,
-                    use_analytical=use_analytical,
-                )
-                V_d = OrnsteinUhlenbeck.V(
-                    d_val,
-                    c_val,
-                    mu_val,
-                    sigma_val,
-                    theta_val,
-                    r,
-                    L_val,
-                    b_star_val,
-                    use_analytical=use_analytical,
-                )
-
-                f_left = G_d * (V_prime_d - 1)
-                f_right = G_prime_d * (V_d - d_val - c_val)
-
-                return f_left - f_right
-
-            # Define search bounds - d_star should be between L and theta
-            bracket_low = max(L_val + 0.001, L_val + 0.01 * sigma_val)
-            bracket_high = min(theta_val - 0.001, theta_val - 0.01 * sigma_val)
-
-            # Try multiple bracket ranges
-            bracket_ranges = [
-                (L_val + 0.01 * sigma_val, theta_val - 0.01 * sigma_val),
-                (L_val + 0.05 * sigma_val, theta_val - 0.05 * sigma_val),
-                (L_val + 0.1 * sigma_val, theta_val - 0.1 * sigma_val),
-                (bracket_low, bracket_high),
-            ]
-
-            found = False
-            for br_low, br_high in bracket_ranges:
-                br_low = max(br_low, L_val + 0.001)
-                br_high = min(br_high, theta_val - 0.001)
-
-                if br_low >= br_high:
-                    continue
-
-                # Check if bracket has opposite signs
-                f_low = f(br_low)
-                f_high = f(br_high)
-
-                if f_low * f_high < 0:
-                    try:
-                        d_result = brentq(f, br_low, br_high, xtol=1e-8, maxiter=100)
-                        if L_val < d_result < theta_val:
-                            result[idx] = d_result
-                            found = True
-                            break
-                    except (ValueError, RuntimeError):
-                        continue
-
-            if not found:
-                # Fallback: use fsolve with initial guess
+            # initial_guess should be a vector of the same shape as broadcasted arrays
+            initial_guess_arr = np.asarray(initial_guess)
+            if initial_guess_arr.ndim == 0:
+                # Scalar provided - broadcast to match shape
+                initial_guess_arr = np.broadcast_to(initial_guess_arr, mu_arr.shape)
+            else:
+                # Vector provided - ensure it can be broadcast to match shape
                 try:
-                    d_result = fsolve(f, initial_guess_val, xtol=1e-8, maxfev=200)[0]
-                    result[idx] = max(min(d_result, theta_val - 0.001), L_val + 0.001)
-                except:
-                    result[idx] = initial_guess_val
+                    initial_guess_arr = np.broadcast_to(
+                        initial_guess_arr, mu_arr.shape
+                    ).copy()
+                except ValueError as e:
+                    raise ValueError(
+                        f"initial_guess must be broadcastable to shape {mu_arr.shape} "
+                        f"(matching mu, sigma, theta after broadcasting), got shape {initial_guess_arr.shape}"
+                    ) from e
+            # Ensure initial guess is between L and theta
+            initial_guess_arr = np.maximum(initial_guess_arr, L_arr + 0.001)
+            initial_guess_arr = np.minimum(initial_guess_arr, theta_arr - 0.001)
+
+        # Define vectorized function to find root of: f(d) = f_left - f_right
+        def f_entry(d):
+            # Ensure d is properly shaped and broadcast with other arrays
+            d_arr = np.asarray(d)
+            if d_arr.shape != mu_arr.shape:
+                # Broadcast d to match mu_arr shape
+                d_arr = np.broadcast_to(d_arr, mu_arr.shape)
+
+            G_d = OrnsteinUhlenbeck.G(
+                d_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
+            )
+            V_prime_d = OrnsteinUhlenbeck.V_L_prime(
+                d_arr,
+                c_arr,
+                mu_arr,
+                sigma_arr,
+                theta_arr,
+                r,
+                L_arr,
+                exit_level_arr,
+                h,
+                use_analytical=use_analytical,
+            )
+            G_prime_d = OrnsteinUhlenbeck.G_prime(
+                d_arr,
+                mu_arr,
+                sigma_arr,
+                theta_arr,
+                r,
+                h=h,
+                use_analytical=use_analytical,
+            )
+            V_d = OrnsteinUhlenbeck.V_L(
+                d_arr,
+                c_arr,
+                mu_arr,
+                sigma_arr,
+                theta_arr,
+                r,
+                L_arr,
+                exit_level_arr,
+                use_analytical=use_analytical,
+            )
+
+            f_left = G_d * (V_prime_d - 1)
+            f_right = G_prime_d * (V_d - d_arr - c_arr)
+
+            return f_left - f_right
+
+        # Define vectorized derivative using numerical differentiation
+        def df_entry_dx(d):
+            d_arr = np.asarray(d)
+            if d_arr.shape != mu_arr.shape:
+                d_arr = np.broadcast_to(d_arr, mu_arr.shape)
+            h_num = 1e-6
+            return (f_entry(d_arr + h_num) - f_entry(d_arr - h_num)) / (2 * h_num)
+
+        # Use Newton's method to find result
+        # Entry level must be between L and theta
+        result = newton_vectorized(
+            f_entry,
+            df_entry_dx,
+            initial_guess_arr,
+            max_iter=50,
+            tol=1e-8,
+            step_direction="positive",
+        )
+        # Validate result is in valid range
+        result = np.asarray(result)
+        if result.shape != mu_arr.shape:
+            result = np.broadcast_to(result, mu_arr.shape)
+        # If result is not in [L, theta], it's invalid - use analytical as fallback
+        invalid_mask = (result <= L_arr) | (result >= theta_arr)
+        if np.any(invalid_mask):
+            analytical_result = OrnsteinUhlenbeck.get_optimal_entry_level(
+                mu=mu_arr[invalid_mask] if mu_arr.ndim > 0 else mu,
+                sigma=sigma_arr[invalid_mask] if sigma_arr.ndim > 0 else sigma,
+                theta=theta_arr[invalid_mask] if theta_arr.ndim > 0 else theta,
+                r=r,
+                c=c_arr[invalid_mask] if c_arr.ndim > 0 else c,
+                L=L_arr[invalid_mask] if L_arr.ndim > 0 else L,
+                exit_level=exit_level_arr[invalid_mask]
+                if exit_level_arr.ndim > 0
+                else exit_level_arr,
+                use_analytical=True,
+            )
+            if isinstance(analytical_result, np.ndarray):
+                result[invalid_mask] = analytical_result
+            else:
+                result[invalid_mask] = analytical_result
+
+        # Ensure result is properly shaped
+        result = np.asarray(result)
+        if result.shape != mu_arr.shape:
+            result = np.broadcast_to(result, mu_arr.shape)
 
         # Return scalar if input was scalar
         if (
@@ -1620,9 +1752,11 @@ class OrnsteinUhlenbeck(StochasticModel):
             and np.isscalar(theta)
             and np.isscalar(c)
             and (L is None or np.isscalar(L))
-            and (initial_guess is None or np.isscalar(initial_guess))
-            and (b_star is None or np.isscalar(b_star))
+            and (exit_level is None or np.isscalar(exit_level))
         ):
+            # Extract single element before converting to float
+            if isinstance(result, np.ndarray):
+                return float(result.item())
             return float(result)
 
         return result

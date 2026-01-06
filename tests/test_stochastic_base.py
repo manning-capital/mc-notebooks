@@ -3,8 +3,6 @@ Tests for stochastic base classes and result dataclasses.
 """
 
 import pytest
-import numpy as np
-from numpy.typing import NDArray
 
 from src.utils.stochastic import (
     DELTA_T,
@@ -85,10 +83,12 @@ class TestStochasticModel:
 
     def test_params_property_setter(self):
         """Test that params property can be set."""
-        from src.utils.stochastic import GeometricBrownianMotion, GeometricBrownianMotionResult
+        from src.utils.stochastic import (
+            GeometricBrownianMotion,
+            GeometricBrownianMotionResult,
+        )
 
         gbm = GeometricBrownianMotion()
         result = GeometricBrownianMotionResult(mu=0.1, sigma=0.2)
         gbm.params = result
         assert gbm.params == result
-
