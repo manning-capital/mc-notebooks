@@ -14,11 +14,16 @@ from .base import (
 )
 
 # Import rolling classes for convenience
-from .rolling import (
+from .rolling_v2 import (
     RollingCointegrationResults,
     RollingOrnsteinUhlenbeckResults,
     RollingCointegration,
     RollingOrnsteinUhlenbeck,
+)
+
+# Import Dask helper functions
+from .dask_helpers import (
+    rolling_ornstein_uhlenbeck,
 )
 
 __all__ = [
@@ -39,4 +44,6 @@ __all__ = [
     # Rolling model classes
     "RollingCointegration",
     "RollingOrnsteinUhlenbeck",
+    # Dask helpers
+    "rolling_ornstein_uhlenbeck",
 ]

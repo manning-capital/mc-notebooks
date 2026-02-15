@@ -1,10 +1,20 @@
-from typing import Optional
+import warnings
+
 import numpy as np
 import statsmodels.api as sm
 from scipy.integrate import quad
 from scipy.special import pbdv, gammaln
 from scipy.stats import norm
 from typing import Literal
+
+# Default step size for finite difference approximations in prime calculations
+H = 1e-6
+
+# Threshold below which the OU process is considered degenerate.
+# When mu < threshold, the process degenerates to Brownian motion (no mean reversion),
+# and the F/G integrals diverge due to r/mu terms.
+# When sigma < threshold, the process becomes deterministic (no stochastic component).
+DEGENERATE_OU_THRESHOLD = 1e-6
 
 
 def newton_vectorized(
@@ -500,17 +510,70 @@ class OrnsteinUhlenbeck(StochasticModel):
         )
 
     @staticmethod
+    def f_integrand(
+        u: float,
+        x: float,
+        mu: float,
+        sigma: float,
+        theta: float,
+        derivative: int = 0,
+        r: float = 0.01,
+    ) -> float:
+        """
+        Computes the f function for various derivatives with respect to x based on the base function f(u, r).
+        f(u, r) = u^((r/mu) - 1) * e^(sqrt((2*mu)/(sigma^2)) * (x - theta) * u  - u^2 / 2)
+        """
+        alpha = (r / mu) - 1 + derivative
+        beta = np.sqrt((2 * mu) / (sigma**2)) * (x - theta)
+        return (beta**derivative) * (u**alpha) * np.exp(beta * u - u**2 / 2)
+
+    @staticmethod
+    def g_integrand(
+        u: float,
+        x: float,
+        mu: float,
+        sigma: float,
+        theta: float,
+        derivative: int = 0,
+        r: float = 0.01,
+    ) -> float:
+        """
+        Computes the f function for various derivatives with respect to x based on the base function f(u, r).
+        f(u, r) = u^((r/mu) - 1) * e^(sqrt((2*mu)/(sigma^2)) * (x - theta) * u  - u^2 / 2)
+        """
+        alpha = (r / mu) - 1 + derivative
+        beta = np.sqrt((2 * mu) / (sigma**2)) * (theta - x)
+        return (beta**derivative) * (u**alpha) * np.exp(beta * u - u**2 / 2)
+
+    @staticmethod
+    def f_prime(
+        u: float, x: float, mu: float, sigma: float, theta: float, r: float = 0.01
+    ) -> float:
+        """
+        Computes the derivative of f with respect to x.
+        f'(u, r) = sqrt((2*mu)/(sigma^2)) * u^((r/mu) - 1) * e^(sqrt((2*mu)/(sigma^2)) * (x - theta) * u  - u^2 / 2)
+        """
+        return (
+            np.sqrt((2 * mu) / (sigma**2))
+            * u ** (r / mu)
+            * np.exp(np.sqrt((2 * mu) / (sigma**2)) * (x - theta) * u - u**2 / 2)
+        )
+
+    @staticmethod
     def F(
         x: float | np.ndarray,
         mu: float | np.ndarray,
         sigma: float | np.ndarray,
         theta: float | np.ndarray,
         r: float = 0.01,
-        use_analytical: bool = False,
+        derivative: int = 0,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
-        Computes the F function.
-        F(x, r) = integral f(u, x, r) du from 0 to infinity
+        Computes the F function or its nth derivative with respect to x.
+            derivative=0: F(x, r)   = integral f(u, x, r) du from 0 to infinity
+            derivative=1: F'(x, r)  = dF/dx
+            derivative=2: F''(x, r) = d²F/dx²
 
         By default uses numerical integration with quad for accuracy.
         An experimental analytical approximation using parabolic cylinder functions
@@ -519,15 +582,17 @@ class OrnsteinUhlenbeck(StochasticModel):
         Parameters
         ----------
         x : float or ndarray
-            Single value or array of x values
+            Absolute position values.
         mu : float or ndarray
             Mean reversion speed parameter(s)
         sigma : float or ndarray
             Volatility parameter(s)
         theta : float or ndarray
-            Long-term mean parameter(s)
+            Mean reversion level(s)
         r : float, optional
             Discount rate (default: 0.01)
+        derivative : int, optional
+            Order of derivative with respect to x (default: 0)
         use_analytical : bool, optional
             If True, use experimental analytical approximation (faster but less accurate).
             If False, use numerical integration with quad (default, most accurate).
@@ -547,122 +612,21 @@ class OrnsteinUhlenbeck(StochasticModel):
         (~1-2% error) that vary with the parameters, particularly with r/mu ratio.
         Use only if speed is critical and small errors are acceptable.
         """
-        if not use_analytical:
-            # Use numerical integration (default, most accurate)
-            all_scalar = (
-                np.isscalar(x)
-                and np.isscalar(mu)
-                and np.isscalar(sigma)
-                and np.isscalar(theta)
-            )
-
-            if all_scalar:
-                return quad(
-                    lambda u: OrnsteinUhlenbeck.f(
-                        u, x, mu=mu, sigma=sigma, theta=theta, r=r
-                    ),
-                    0,
-                    np.inf,
-                )[0]
-
-            # For arrays, compute element-wise (arrays must have equal lengths)
-            x_arr = np.atleast_1d(x)
-            mu_arr = np.atleast_1d(mu)
-            sigma_arr = np.atleast_1d(sigma)
-            theta_arr = np.atleast_1d(theta)
-
-            # Broadcast to same shape if needed, then compute element-wise
-            x_arr, mu_arr, sigma_arr, theta_arr = np.broadcast_arrays(
-                x_arr, mu_arr, sigma_arr, theta_arr
-            )
-
-            result = np.empty(x_arr.shape)
-            for idx in np.ndindex(x_arr.shape):
-                result[idx] = quad(
-                    lambda u: OrnsteinUhlenbeck.f(
-                        u,
-                        x_arr[idx],
-                        mu=mu_arr[idx],
-                        sigma=sigma_arr[idx],
-                        theta=theta_arr[idx],
-                        r=r,
-                    ),
-                    0,
-                    np.inf,
-                )[0]
-
-            if result.ndim == 0:
-                return float(result)
-            return result
-
-        # Robust analytical approximation using parabolic cylinder functions
-        # Always uses pbdv with corrected prefactor (no 2^power term)
-        # Based on: ∫₀^∞ u^α exp(βu - u²/2) du = exp(β²/4) * Γ(α+1) * D_{-α-1}(-β)
-
-        # Convert inputs to arrays and broadcast for element-wise computation
-        x_arr = np.atleast_1d(x)
         mu_arr = np.atleast_1d(mu)
         sigma_arr = np.atleast_1d(sigma)
+        x_arr = np.atleast_1d(x)
         theta_arr = np.atleast_1d(theta)
-
-        # Broadcast to same shape if needed, then compute element-wise
-        x_arr, mu_arr, sigma_arr, theta_arr = np.broadcast_arrays(
-            x_arr, mu_arr, sigma_arr, theta_arr
+        mu_arr, sigma_arr, x_arr, theta_arr = np.broadcast_arrays(
+            mu_arr, sigma_arr, x_arr, theta_arr
         )
 
-        # Compute parameters element-wise
         alpha = (r / mu_arr) - 1
-        beta = np.sqrt(2 * mu_arr / sigma_arr**2) * (x_arr - theta_arr)
+        scale = np.sqrt(2 * mu_arr / sigma_arr**2)
+        beta = scale * (x_arr - theta_arr)
 
-        # Initialize result array
-        result = np.empty(x_arr.shape, dtype=float)
-
-        # Always use pbdv with corrected prefactor (no 2^power term)
-        # Special case: alpha ≈ 0 uses exact formula
-        alpha_zero_mask = np.isclose(alpha, 0, atol=1e-10)
-        non_zero_mask = ~alpha_zero_mask
-
-        # Special case: alpha ≈ 0 (exact formula, vectorized)
-        if np.any(alpha_zero_mask):
-            result[alpha_zero_mask] = (
-                np.exp(beta[alpha_zero_mask] ** 2 / 2)
-                * np.sqrt(2 * np.pi)
-                * norm.cdf(beta[alpha_zero_mask])
-            )
-
-        # All other cases: use parabolic cylinder function (vectorized)
-        if np.any(non_zero_mask):
-            alpha_nonzero = alpha[non_zero_mask]
-            beta_nonzero = beta[non_zero_mask]
-
-            # Compute nu for all cases
-            nu_nonzero = -(alpha_nonzero + 1)
-
-            # Compute D values - pbdv can handle arrays
-            D_vals, _ = pbdv(nu_nonzero, -beta_nonzero)
-
-            # Prefactor: exp(β²/4) * Γ(α+1) * D_{-α-1}(-β)
-            # Note: The 2^power term cancels out (2^((α-1)/2) * 2^((1-α)/2) = 1)
-            # So we use just exp(β²/4) * Γ(α+1)
-            log_prefactor = gammaln(alpha_nonzero + 1) + beta_nonzero**2 / 4
-
-            # Compute with pbdv (works for all practical cases)
-            non_zero_result = np.exp(log_prefactor) * D_vals
-
-            # Check for overflow/invalid results
-            invalid_mask = ~np.isfinite(non_zero_result)
-            if np.any(invalid_mask):
-                # For overflow cases, set to a large but finite value
-                # or raise warning - in practice these are extremely rare
-                non_zero_result[invalid_mask] = np.inf
-
-            # Assign back to result array
-            result[non_zero_mask] = non_zero_result
-
-        if result.ndim == 0:
-            return float(result)
-
-        return result
+        return OrnsteinUhlenbeck._compute_integral(
+            alpha, scale, beta, derivative=derivative, use_analytical=use_analytical
+        )
 
     @staticmethod
     def g(
@@ -677,17 +641,189 @@ class OrnsteinUhlenbeck(StochasticModel):
         )
 
     @staticmethod
+    def g_prime(
+        u: float, x: float, mu: float, sigma: float, theta: float, r: float = 0.01
+    ) -> float:
+        """
+        Computes the derivative of g with respect to x.
+        g'(u, x, r) = -sqrt((2*mu)/(sigma^2)) * u^((r/mu) - 2) * e^(sqrt((2*mu)/(sigma^2)) * (theta - x) * u  - u^2 / 2)
+        """
+        return (
+            -np.sqrt((2 * mu) / (sigma**2))
+            * u ** ((r / mu) - 2)
+            * np.exp(np.sqrt((2 * mu) / (sigma**2)) * (theta - x) * u - u**2 / 2)
+        )
+
+    @staticmethod
+    def _compute_integral(
+        alpha: float | np.ndarray,
+        scale: float | np.ndarray,
+        beta: float | np.ndarray,
+        derivative: int = 0,
+        use_analytical: bool = True,
+    ) -> float | np.ndarray:
+        """
+        General-purpose integral of the form:
+            scale^derivative * integral_0^inf u^(alpha + derivative) * exp(beta*u - u^2/2) du
+
+        This is the shared computation underlying F, G, and their derivatives.
+        The derivative parameter controls both the alpha offset and scaling factor,
+        matching the pattern from f_integrand/g_integrand:
+            derivative=0: integral u^alpha * exp(beta*u - u^2/2) du           (F, G)
+            derivative=1: scale * integral u^(alpha+1) * exp(beta*u - u^2/2) du (F', G')
+            derivative=2: scale^2 * integral u^(alpha+2) * exp(beta*u - u^2/2) du (F'', G'')
+
+        Callers provide the base alpha = (r/mu) - 1 and the appropriate scale and beta:
+            F family:  scale = sqrt(2mu/sigma^2), beta = scale * (x - theta)
+            G family:  scale = sqrt(2mu/sigma^2), beta = scale * (theta - x)
+
+        Parameters
+        ----------
+        alpha : float or ndarray
+            Base power of u in the integrand (before derivative offset)
+        scale : float or ndarray
+            Scale factor for derivatives (sqrt(2*mu/sigma^2))
+        beta : float or ndarray
+            Coefficient of u in the exponential
+        derivative : int, optional
+            Order of derivative (default: 0). Adds to alpha and scales by scale^derivative.
+        use_analytical : bool, optional
+            If True, use parabolic cylinder function approximation.
+            If False, use numerical integration with quad (default).
+
+        Returns
+        -------
+        float or ndarray
+        """
+        # Apply derivative: shift alpha and compute scale factor
+        effective_alpha = alpha + derivative if derivative != 0 else alpha
+        scale_factor = scale**derivative if derivative != 0 else 1.0
+
+        if not use_analytical:
+            all_scalar = (
+                np.isscalar(effective_alpha)
+                and np.isscalar(beta)
+                and np.isscalar(scale_factor)
+            )
+
+            if all_scalar:
+                val = quad(
+                    lambda u: u**effective_alpha * np.exp(beta * u - u**2 / 2),
+                    0,
+                    np.inf,
+                )[0]
+                return scale_factor * val
+
+            alpha_arr = np.atleast_1d(effective_alpha)
+            beta_arr = np.atleast_1d(beta)
+            scale_factor_arr = np.atleast_1d(scale_factor)
+            alpha_arr, beta_arr, scale_factor_arr = np.broadcast_arrays(
+                alpha_arr, beta_arr, scale_factor_arr
+            )
+
+            result = np.empty(alpha_arr.shape)
+            for idx in np.ndindex(alpha_arr.shape):
+                result[idx] = (
+                    scale_factor_arr[idx]
+                    * quad(
+                        lambda u, a=alpha_arr[idx], b=beta_arr[idx]: u**a
+                        * np.exp(b * u - u**2 / 2),
+                        0,
+                        np.inf,
+                    )[0]
+                )
+
+            if result.ndim == 0:
+                return float(result)
+            return result
+
+        # Analytical path using parabolic cylinder functions
+        # Based on: integral_0^inf u^alpha exp(beta*u - u^2/2) du
+        #         = exp(beta^2/4) * Gamma(alpha+1) * D_{-alpha-1}(-beta)
+        alpha_arr = np.atleast_1d(effective_alpha)
+        beta_arr = np.atleast_1d(beta)
+        scale_factor_arr = np.atleast_1d(scale_factor)
+        alpha_arr, beta_arr, scale_factor_arr = np.broadcast_arrays(
+            alpha_arr, beta_arr, scale_factor_arr
+        )
+
+        result = np.empty(alpha_arr.shape, dtype=float)
+
+        alpha_zero_mask = np.isclose(alpha_arr, 0, atol=1e-10)
+        non_zero_mask = ~alpha_zero_mask
+
+        # Special case: alpha ~ 0 (exact formula)
+        if np.any(alpha_zero_mask):
+            result[alpha_zero_mask] = (
+                scale_factor_arr[alpha_zero_mask]
+                * np.exp(beta_arr[alpha_zero_mask] ** 2 / 2)
+                * np.sqrt(2 * np.pi)
+                * norm.cdf(beta_arr[alpha_zero_mask])
+            )
+
+        if np.any(non_zero_mask):
+            a_nz = alpha_arr[non_zero_mask]
+            b_nz = beta_arr[non_zero_mask]
+            s_nz = scale_factor_arr[non_zero_mask]
+            nu_nz = -(a_nz + 1)
+
+            D_vals, _ = pbdv(nu_nz, -b_nz)
+            log_prefactor = gammaln(a_nz + 1) + b_nz**2 / 4
+
+            non_zero_result = np.zeros_like(D_vals)
+            D_is_nan = np.isnan(D_vals)
+            D_is_posinf = np.isposinf(D_vals)
+            D_is_neginf = np.isneginf(D_vals)
+            D_is_finite = ~(D_is_nan | D_is_posinf | D_is_neginf)
+
+            if np.any(D_is_nan):
+                prefactor_is_zero = log_prefactor[D_is_nan] == -np.inf
+                non_zero_result[D_is_nan] = np.where(prefactor_is_zero, 0.0, np.nan)
+
+            if np.any(D_is_posinf):
+                prefactor_is_zero = log_prefactor[D_is_posinf] == -np.inf
+                non_zero_result[D_is_posinf] = np.where(
+                    prefactor_is_zero, np.nan, np.inf
+                )
+
+            if np.any(D_is_neginf):
+                prefactor_is_zero = log_prefactor[D_is_neginf] == -np.inf
+                non_zero_result[D_is_neginf] = np.where(
+                    prefactor_is_zero, np.nan, -np.inf
+                )
+
+            if np.any(D_is_finite):
+                prefactor = np.exp(log_prefactor[D_is_finite])
+                non_zero_result[D_is_finite] = prefactor * D_vals[D_is_finite]
+                finite_overflow = ~np.isfinite(non_zero_result[D_is_finite])
+                if np.any(finite_overflow):
+                    indices = np.where(D_is_finite)[0][finite_overflow]
+                    signs = np.sign(prefactor[finite_overflow]) * np.sign(
+                        D_vals[indices]
+                    )
+                    non_zero_result[indices] = signs * np.inf
+
+            result[non_zero_mask] = s_nz * non_zero_result
+
+        if result.ndim == 0:
+            return float(result)
+        return result
+
+    @staticmethod
     def G(
         x: float | np.ndarray,
         mu: float | np.ndarray,
         sigma: float | np.ndarray,
         theta: float | np.ndarray,
         r: float = 0.01,
-        use_analytical: bool = False,
+        derivative: int = 0,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
-        Computes the G function.
-        G(x, r) = integral g(u, x, r) du from 0 to infinity
+        Computes the G function or its nth derivative with respect to x.
+            derivative=0: G(x, r)   = integral g(u, x, r) du from 0 to infinity
+            derivative=1: G'(x, r)  = dG/dx
+            derivative=2: G''(x, r) = d²G/dx²
 
         By default uses numerical integration with quad for accuracy.
         An experimental analytical approximation using parabolic cylinder functions
@@ -696,15 +832,17 @@ class OrnsteinUhlenbeck(StochasticModel):
         Parameters
         ----------
         x : float or ndarray
-            Single value or array of x values
+            Absolute position values.
         mu : float or ndarray
             Mean reversion speed parameter(s)
         sigma : float or ndarray
             Volatility parameter(s)
         theta : float or ndarray
-            Long-term mean parameter(s)
+            Mean reversion level(s)
         r : float, optional
             Discount rate (default: 0.01)
+        derivative : int, optional
+            Order of derivative with respect to x (default: 0)
         use_analytical : bool, optional
             If True, use experimental analytical approximation (faster but less accurate).
             If False, use numerical integration with quad (default, most accurate).
@@ -724,228 +862,21 @@ class OrnsteinUhlenbeck(StochasticModel):
         (~1-2% error) that vary with the parameters. Use only if speed is critical
         and small errors are acceptable.
         """
-        if not use_analytical:
-            # Use numerical integration (default, most accurate)
-            all_scalar = (
-                np.isscalar(x)
-                and np.isscalar(mu)
-                and np.isscalar(sigma)
-                and np.isscalar(theta)
-            )
-
-            if all_scalar:
-                return quad(
-                    lambda u: OrnsteinUhlenbeck.g(
-                        u, x, mu=mu, sigma=sigma, theta=theta, r=r
-                    ),
-                    0,
-                    np.inf,
-                )[0]
-
-            # For arrays, compute element-wise (arrays must have equal lengths)
-            x_arr = np.atleast_1d(x)
-            mu_arr = np.atleast_1d(mu)
-            sigma_arr = np.atleast_1d(sigma)
-            theta_arr = np.atleast_1d(theta)
-
-            # Broadcast to same shape if needed, then compute element-wise
-            x_arr, mu_arr, sigma_arr, theta_arr = np.broadcast_arrays(
-                x_arr, mu_arr, sigma_arr, theta_arr
-            )
-
-            result = np.empty(x_arr.shape)
-            for idx in np.ndindex(x_arr.shape):
-                result[idx] = quad(
-                    lambda u: OrnsteinUhlenbeck.g(
-                        u,
-                        x_arr[idx],
-                        mu=mu_arr[idx],
-                        sigma=sigma_arr[idx],
-                        theta=theta_arr[idx],
-                        r=r,
-                    ),
-                    0,
-                    np.inf,
-                )[0]
-
-            if result.ndim == 0:
-                return float(result)
-            return result
-
-        # Robust analytical approximation using parabolic cylinder functions
-        # Always uses pbdv with corrected prefactor (no 2^power term)
-        # Based on: ∫₀^∞ u^α exp(βu - u²/2) du = exp(β²/4) * Γ(α+1) * D_{-α-1}(-β) where β = √(2μ/σ²)(θ-x) for G
-
-        # Convert inputs to arrays and broadcast for element-wise computation
-        x_arr = np.atleast_1d(x)
         mu_arr = np.atleast_1d(mu)
         sigma_arr = np.atleast_1d(sigma)
+        x_arr = np.atleast_1d(x)
         theta_arr = np.atleast_1d(theta)
-
-        # Broadcast to same shape if needed, then compute element-wise
-        x_arr, mu_arr, sigma_arr, theta_arr = np.broadcast_arrays(
-            x_arr, mu_arr, sigma_arr, theta_arr
+        mu_arr, sigma_arr, x_arr, theta_arr = np.broadcast_arrays(
+            mu_arr, sigma_arr, x_arr, theta_arr
         )
 
-        # Compute parameters element-wise (note: theta - x for G, vs x - theta for F)
         alpha = (r / mu_arr) - 1
-        beta = np.sqrt(2 * mu_arr / sigma_arr**2) * (theta_arr - x_arr)
+        scale = -1 * np.sqrt(2 * mu_arr / sigma_arr**2)
+        beta = scale * (x_arr - theta_arr)
 
-        # Initialize result array
-        result = np.empty(x_arr.shape, dtype=float)
-
-        # Always use pbdv with corrected prefactor (no 2^power term)
-        # Special case: alpha ≈ 0 uses exact formula
-        alpha_zero_mask = np.isclose(alpha, 0, atol=1e-10)
-        non_zero_mask = ~alpha_zero_mask
-
-        # Special case: alpha ≈ 0 (exact formula, vectorized)
-        if np.any(alpha_zero_mask):
-            result[alpha_zero_mask] = (
-                np.exp(beta[alpha_zero_mask] ** 2 / 2)
-                * np.sqrt(2 * np.pi)
-                * norm.cdf(beta[alpha_zero_mask])
-            )
-
-        # All other cases: use parabolic cylinder function (vectorized)
-        if np.any(non_zero_mask):
-            alpha_nonzero = alpha[non_zero_mask]
-            beta_nonzero = beta[non_zero_mask]
-
-            # Compute nu for all cases
-            nu_nonzero = -(alpha_nonzero + 1)
-
-            # Compute D values - pbdv can handle arrays
-            D_vals, _ = pbdv(nu_nonzero, -beta_nonzero)
-
-            # Prefactor: exp(β²/4) * Γ(α+1) * D_{-α-1}(-β)
-            # Note: The 2^power term cancels out (2^((α-1)/2) * 2^((1-α)/2) = 1)
-            # So we use just exp(β²/4) * Γ(α+1)
-            log_prefactor = gammaln(alpha_nonzero + 1) + beta_nonzero**2 / 4
-
-            # Compute with pbdv (works for all practical cases)
-            non_zero_result = np.exp(log_prefactor) * D_vals
-
-            # Check for overflow/invalid results
-            invalid_mask = ~np.isfinite(non_zero_result)
-            if np.any(invalid_mask):
-                # For overflow cases, set to a large but finite value
-                # or raise warning - in practice these are extremely rare
-                non_zero_result[invalid_mask] = np.inf
-
-            # Assign back to result array
-            result[non_zero_mask] = non_zero_result
-
-        if result.ndim == 0:
-            return float(result)
-
-        return result
-
-    @staticmethod
-    def F_prime(
-        x: float | np.ndarray,
-        mu: float | np.ndarray,
-        sigma: float | np.ndarray,
-        theta: float | np.ndarray,
-        r: float = 0.01,
-        h: float = 1e-6,
-        use_analytical: bool = False,
-    ) -> float | np.ndarray:
-        """
-        Computes the F_prime function.
-        F_prime(x, r) = dF(x, r) / dx
-
-        Uses finite difference approximation: (F(x+h) - F(x)) / h
-
-        Parameters
-        ----------
-        x : float or ndarray
-            Single value or array of x values
-        mu : float or ndarray
-            Mean reversion speed parameter(s)
-        sigma : float or ndarray
-            Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
-        r : float, optional
-            Discount rate (default: 0.01)
-        h : float, optional
-            Step size for finite difference (default: 1e-6)
-        use_analytical : bool, optional
-            If True, use analytical F function. If False, use numerical (default: False)
-
-        Returns
-        -------
-        float or ndarray
-            Scalar if all inputs are scalar, otherwise array with shape
-            determined by broadcasting the input arrays
-        """
-        return (
-            OrnsteinUhlenbeck.F(
-                x + h,
-                mu=mu,
-                sigma=sigma,
-                theta=theta,
-                r=r,
-                use_analytical=use_analytical,
-            )
-            - OrnsteinUhlenbeck.F(
-                x, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
-            )
-        ) / h
-
-    @staticmethod
-    def G_prime(
-        x: float | np.ndarray,
-        mu: float | np.ndarray,
-        sigma: float | np.ndarray,
-        theta: float | np.ndarray,
-        r: float = 0.01,
-        h: float = 1e-6,
-        use_analytical: bool = False,
-    ) -> float | np.ndarray:
-        """
-        Computes the G_prime function.
-        G_prime(x, r) = dG(x, r) / dx
-
-        Uses finite difference approximation: (G(x+h) - G(x)) / h
-
-        Parameters
-        ----------
-        x : float or ndarray
-            Single value or array of x values
-        mu : float or ndarray
-            Mean reversion speed parameter(s)
-        sigma : float or ndarray
-            Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
-        r : float, optional
-            Discount rate (default: 0.01)
-        h : float, optional
-            Step size for finite difference (default: 1e-6)
-        use_analytical : bool, optional
-            If True, use analytical G function. If False, use numerical (default: False)
-
-        Returns
-        -------
-        float or ndarray
-            Scalar if all inputs are scalar, otherwise array with shape
-            determined by broadcasting the input arrays
-        """
-        return (
-            OrnsteinUhlenbeck.G(
-                x + h,
-                mu=mu,
-                sigma=sigma,
-                theta=theta,
-                r=r,
-                use_analytical=use_analytical,
-            )
-            - OrnsteinUhlenbeck.G(
-                x, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
-            )
-        ) / h
+        return OrnsteinUhlenbeck._compute_integral(
+            alpha, scale, beta, derivative=derivative, use_analytical=use_analytical
+        )
 
     @staticmethod
     def V(
@@ -956,10 +887,29 @@ class OrnsteinUhlenbeck(StochasticModel):
         r: float | np.ndarray,
         c: float | np.ndarray,
         exit_level: float | np.ndarray,
-        use_analytical: bool = False,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
         The value function V(x, r).
+
+        Parameters
+        ----------
+        x : float or ndarray
+            Absolute position values.
+        mu : float or ndarray
+            Mean reversion speed parameter(s)
+        sigma : float or ndarray
+            Volatility parameter(s)
+        theta : float or ndarray
+            Mean reversion level(s)
+        r : float or ndarray
+            Discount rate(s)
+        c : float or ndarray
+            Transaction cost(s)
+        exit_level : float or ndarray
+            Exit level(s) as absolute positions
+        use_analytical : bool, optional
+            If True, use analytical F function (default: False)
         """
         # Convert to arrays and broadcast to same shape
         x_arr = np.atleast_1d(x)
@@ -992,7 +942,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             r_arr,
             use_analytical=use_analytical,
         )
-        V_left = (exit_level_arr - c_arr) * F_x / F_exit
+        V_left = ((exit_level_arr - c_arr) / F_exit) * F_x
 
         # Compute V_right for all elements (will be used where left_mask is False)
         V_right = x_arr - c_arr
@@ -1023,31 +973,208 @@ class OrnsteinUhlenbeck(StochasticModel):
         r: float | np.ndarray,
         c: float | np.ndarray,
         exit_level: float | np.ndarray,
-        h: float = 1e-6,
-        use_analytical: bool = False,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
-        The derivative of the value function V(x, r).
+        The derivative of the value function V(x, r) with respect to x.
+
+        For x < exit_level: V'(x) = [(exit_level - c) / F(exit_level)] * F'(x)
+        For x >= exit_level: V'(x) = 1
+
+        Parameters
+        ----------
+        x : float or ndarray
+            Absolute position values.
+        mu : float or ndarray
+            Mean reversion speed parameter(s)
+        sigma : float or ndarray
+            Volatility parameter(s)
+        theta : float or ndarray
+            Mean reversion level(s)
+        r : float or ndarray
+            Discount rate(s)
+        c : float or ndarray
+            Transaction cost(s)
+        exit_level : float or ndarray
+            Exit level(s) as absolute positions
+        use_analytical : bool, optional
+            If True, use analytical F function (default: False)
+
+        Returns
+        -------
+        float or ndarray
+            Derivative dV/dx
         """
-        return (
-            OrnsteinUhlenbeck.V(
-                x + h, mu, sigma, theta, r, c, exit_level, use_analytical=use_analytical
+        # Convert to arrays and broadcast to same shape
+        x_arr = np.atleast_1d(x)
+        mu_arr = np.atleast_1d(mu)
+        sigma_arr = np.atleast_1d(sigma)
+        theta_arr = np.atleast_1d(theta)
+        r_arr = np.atleast_1d(r)
+        c_arr = np.atleast_1d(c)
+        exit_level_arr = np.atleast_1d(exit_level)
+
+        # Broadcast all arrays to the same shape
+        x_arr, mu_arr, sigma_arr, theta_arr, r_arr, c_arr, exit_level_arr = (
+            np.broadcast_arrays(
+                x_arr, mu_arr, sigma_arr, theta_arr, r_arr, c_arr, exit_level_arr
             )
-            - OrnsteinUhlenbeck.V(
-                x - h, mu, sigma, theta, r, c, exit_level, use_analytical=use_analytical
+        )
+
+        # Create masks for element-wise operations
+        left_mask = x_arr < exit_level_arr
+
+        # Compute V'_left for all elements (will be used where left_mask is True)
+        # V'(x) = [(exit_level - c) / F(exit_level)] * F'(x)
+        F_prime_x = OrnsteinUhlenbeck.F(
+            x_arr,
+            mu_arr,
+            sigma_arr,
+            theta_arr,
+            r_arr,
+            derivative=1,
+            use_analytical=use_analytical,
+        )
+        F_exit = OrnsteinUhlenbeck.F(
+            exit_level_arr,
+            mu_arr,
+            sigma_arr,
+            theta_arr,
+            r_arr,
+            use_analytical=use_analytical,
+        )
+        V_prime_left = ((exit_level_arr - c_arr) / F_exit) * F_prime_x
+
+        # For x >= exit_level: V'(x) = d/dx(x - c) = 1
+        V_prime_right = np.ones_like(x_arr)
+
+        # Use np.where for element-wise selection
+        result = np.where(left_mask, V_prime_left, V_prime_right)
+
+        # Return scalar if input was scalar
+        if (
+            np.isscalar(x)
+            and np.isscalar(mu)
+            and np.isscalar(sigma)
+            and np.isscalar(theta)
+            and np.isscalar(r)
+            and np.isscalar(c)
+            and np.isscalar(exit_level)
+        ):
+            return float(result)
+
+        return result
+
+    @staticmethod
+    def V_double_prime(
+        x: float | np.ndarray,
+        mu: float | np.ndarray,
+        sigma: float | np.ndarray,
+        theta: float | np.ndarray,
+        r: float | np.ndarray,
+        c: float | np.ndarray,
+        exit_level: float | np.ndarray,
+        use_analytical: bool = True,
+    ) -> float | np.ndarray:
+        """
+        The second derivative of the value function V(x, r) with respect to x.
+
+        For x < exit_level: V''(x) = [(exit_level - c) / F(exit_level)] * F''(x)
+        For x >= exit_level: V''(x) = 0
+
+        Parameters
+        ----------
+        x : float or ndarray
+            Absolute position values.
+        mu : float or ndarray
+            Mean reversion speed parameter(s)
+        sigma : float or ndarray
+            Volatility parameter(s)
+        theta : float or ndarray
+            Mean reversion level(s)
+        r : float or ndarray
+            Discount rate(s)
+        c : float or ndarray
+            Transaction cost(s)
+        exit_level : float or ndarray
+            Exit level(s) as absolute positions
+        use_analytical : bool, optional
+            If True, use analytical F function (default: False)
+
+        Returns
+        -------
+        float or ndarray
+            Second derivative d²V/dx²
+        """
+        # Convert to arrays and broadcast to same shape
+        x_arr = np.atleast_1d(x)
+        mu_arr = np.atleast_1d(mu)
+        sigma_arr = np.atleast_1d(sigma)
+        theta_arr = np.atleast_1d(theta)
+        r_arr = np.atleast_1d(r)
+        c_arr = np.atleast_1d(c)
+        exit_level_arr = np.atleast_1d(exit_level)
+
+        # Broadcast all arrays to the same shape
+        x_arr, mu_arr, sigma_arr, theta_arr, r_arr, c_arr, exit_level_arr = (
+            np.broadcast_arrays(
+                x_arr, mu_arr, sigma_arr, theta_arr, r_arr, c_arr, exit_level_arr
             )
-        ) / (2 * h)
+        )
+
+        # Create masks for element-wise operations
+        left_mask = x_arr < exit_level_arr
+
+        # Compute V''_left for all elements (will be used where left_mask is True)
+        # V''(x) = [(exit_level - c) / F(exit_level)] * F''(x)
+        F_double_prime_x = OrnsteinUhlenbeck.F(
+            x_arr,
+            mu_arr,
+            sigma_arr,
+            theta_arr,
+            r_arr,
+            derivative=2,
+            use_analytical=use_analytical,
+        )
+        F_exit = OrnsteinUhlenbeck.F(
+            exit_level_arr,
+            mu_arr,
+            sigma_arr,
+            theta_arr,
+            r_arr,
+            use_analytical=use_analytical,
+        )
+        V_double_prime_left = (exit_level_arr - c_arr) * F_double_prime_x / F_exit
+
+        # For x >= exit_level: V''(x) = d²/dx²(x - c) = 0
+        V_double_prime_right = np.zeros_like(x_arr)
+
+        # Use np.where for element-wise selection
+        result = np.where(left_mask, V_double_prime_left, V_double_prime_right)
+
+        # Return scalar if input was scalar
+        if (
+            np.isscalar(x)
+            and np.isscalar(mu)
+            and np.isscalar(sigma)
+            and np.isscalar(theta)
+            and np.isscalar(r)
+            and np.isscalar(c)
+            and np.isscalar(exit_level)
+        ):
+            return float(result)
+
+        return result
 
     @staticmethod
     def C(
         c: float | np.ndarray,
         mu: float | np.ndarray,
         sigma: float | np.ndarray,
-        theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
         exit_level: float | np.ndarray,
-        use_analytical: bool = False,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
         The constant C in the OU process.
@@ -1060,14 +1187,12 @@ class OrnsteinUhlenbeck(StochasticModel):
             Mean reversion speed parameter(s)
         sigma : float or ndarray
             Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
         r : float
             Discount rate
         L : float or ndarray
-            Loss level parameter(s)
+            Loss level as spread (L - theta)
         exit_level : float or ndarray
-            Optimal exit level parameter(s)
+            Exit level as spread (exit_level - theta)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
 
@@ -1080,14 +1205,14 @@ class OrnsteinUhlenbeck(StochasticModel):
         return (
             (exit_level - c)
             * OrnsteinUhlenbeck.G(
-                L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
+                L, mu=mu, sigma=sigma, theta=0, r=r, use_analytical=use_analytical
             )
             - (L - c)
             * OrnsteinUhlenbeck.G(
                 exit_level,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
+                theta=0,
                 r=r,
                 use_analytical=use_analytical,
             )
@@ -1096,21 +1221,21 @@ class OrnsteinUhlenbeck(StochasticModel):
                 exit_level,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
+                theta=0,
                 r=r,
                 use_analytical=use_analytical,
             )
             * OrnsteinUhlenbeck.G(
-                L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
+                L, mu=mu, sigma=sigma, theta=0, r=r, use_analytical=use_analytical
             )
             - OrnsteinUhlenbeck.F(
-                L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
+                L, mu=mu, sigma=sigma, theta=0, r=r, use_analytical=use_analytical
             )
             * OrnsteinUhlenbeck.G(
                 exit_level,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
+                theta=0,
                 r=r,
                 use_analytical=use_analytical,
             )
@@ -1121,11 +1246,10 @@ class OrnsteinUhlenbeck(StochasticModel):
         c: float | np.ndarray,
         mu: float | np.ndarray,
         sigma: float | np.ndarray,
-        theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
         exit_level: float | np.ndarray,
-        use_analytical: bool = False,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
         The optimal entry level d_D^*.
@@ -1138,14 +1262,12 @@ class OrnsteinUhlenbeck(StochasticModel):
             Mean reversion speed parameter(s)
         sigma : float or ndarray
             Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
         r : float
             Discount rate
         L : float or ndarray
-            Loss level parameter(s)
+            Loss level as spread (L - theta)
         exit_level : float or ndarray
-            Optimal exit level parameter(s)
+            Exit level as spread (exit_level - theta)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
 
@@ -1161,34 +1283,34 @@ class OrnsteinUhlenbeck(StochasticModel):
                 exit_level,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
+                theta=0,
                 r=r,
                 use_analytical=use_analytical,
             )
             - (exit_level - c)
             * OrnsteinUhlenbeck.F(
-                L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
+                L, mu=mu, sigma=sigma, theta=0, r=r, use_analytical=use_analytical
             )
         ) / (
             OrnsteinUhlenbeck.F(
                 exit_level,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
+                theta=0,
                 r=r,
                 use_analytical=use_analytical,
             )
             * OrnsteinUhlenbeck.G(
-                L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
+                L, mu=mu, sigma=sigma, theta=0, r=r, use_analytical=use_analytical
             )
             - OrnsteinUhlenbeck.F(
-                L, mu=mu, sigma=sigma, theta=theta, r=r, use_analytical=use_analytical
+                L, mu=mu, sigma=sigma, theta=0, r=r, use_analytical=use_analytical
             )
             * OrnsteinUhlenbeck.G(
                 exit_level,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
+                theta=0,
                 r=r,
                 use_analytical=use_analytical,
             )
@@ -1200,11 +1322,10 @@ class OrnsteinUhlenbeck(StochasticModel):
         c: float | np.ndarray,
         mu: float | np.ndarray,
         sigma: float | np.ndarray,
-        theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
         exit_level: float | np.ndarray,
-        use_analytical: bool = False,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
         The value function V_L(x, r).
@@ -1212,21 +1333,19 @@ class OrnsteinUhlenbeck(StochasticModel):
         Parameters
         ----------
         x : float or ndarray
-            Single value or array of x values
+            Spread values (x - theta). MUST be pre-normalized relative to theta.
         c : float or ndarray
             Transaction cost parameter(s)
         mu : float or ndarray
             Mean reversion speed parameter(s)
         sigma : float or ndarray
             Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
         r : float
             Discount rate
         L : float or ndarray
-            Loss level parameter(s)
+            Loss level as spread (L - theta)
         exit_level : float or ndarray
-            Optimal exit level parameter(s)
+            Exit level as spread (exit_level - theta)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
 
@@ -1241,15 +1360,12 @@ class OrnsteinUhlenbeck(StochasticModel):
         c_arr = np.atleast_1d(c)
         mu_arr = np.atleast_1d(mu)
         sigma_arr = np.atleast_1d(sigma)
-        theta_arr = np.atleast_1d(theta)
         L_arr = np.atleast_1d(L)
         exit_level_arr = np.atleast_1d(exit_level)
 
         # Broadcast all arrays to the same shape
-        x_arr, c_arr, mu_arr, sigma_arr, theta_arr, L_arr, exit_level_arr = (
-            np.broadcast_arrays(
-                x_arr, c_arr, mu_arr, sigma_arr, theta_arr, L_arr, exit_level_arr
-            )
+        x_arr, c_arr, mu_arr, sigma_arr, L_arr, exit_level_arr = np.broadcast_arrays(
+            x_arr, c_arr, mu_arr, sigma_arr, L_arr, exit_level_arr
         )
 
         # Element-wise condition: x < exit_level and x > L
@@ -1260,7 +1376,6 @@ class OrnsteinUhlenbeck(StochasticModel):
             c=c_arr,
             mu=mu_arr,
             sigma=sigma_arr,
-            theta=theta_arr,
             r=r,
             L=L_arr,
             exit_level=exit_level_arr,
@@ -1269,14 +1384,13 @@ class OrnsteinUhlenbeck(StochasticModel):
             x_arr,
             mu=mu_arr,
             sigma=sigma_arr,
-            theta=theta_arr,
+            theta=0,
             r=r,
             use_analytical=use_analytical,
         ) + OrnsteinUhlenbeck.D(
             c=c_arr,
             mu=mu_arr,
             sigma=sigma_arr,
-            theta=theta_arr,
             r=r,
             L=L_arr,
             exit_level=exit_level_arr,
@@ -1285,7 +1399,7 @@ class OrnsteinUhlenbeck(StochasticModel):
             x_arr,
             mu=mu_arr,
             sigma=sigma_arr,
-            theta=theta_arr,
+            theta=0,
             r=r,
             use_analytical=use_analytical,
         )
@@ -1300,7 +1414,6 @@ class OrnsteinUhlenbeck(StochasticModel):
             and np.isscalar(c)
             and np.isscalar(mu)
             and np.isscalar(sigma)
-            and np.isscalar(theta)
             and np.isscalar(L)
             and np.isscalar(exit_level)
         ):
@@ -1314,12 +1427,11 @@ class OrnsteinUhlenbeck(StochasticModel):
         c: float | np.ndarray,
         mu: float | np.ndarray,
         sigma: float | np.ndarray,
-        theta: float | np.ndarray,
         r: float,
         L: float | np.ndarray,
         exit_level: float | np.ndarray,
-        h: float = 1e-6,
-        use_analytical: bool = False,
+        h: float | None = None,
+        use_analytical: bool = True,
     ) -> float | np.ndarray:
         """
         The derivative of the value function V_L(x, r).
@@ -1329,23 +1441,21 @@ class OrnsteinUhlenbeck(StochasticModel):
         Parameters
         ----------
         x : float or ndarray
-            Single value or array of x values
+            Spread values (x - theta). MUST be pre-normalized relative to theta.
         c : float or ndarray
             Transaction cost parameter(s)
         mu : float or ndarray
             Mean reversion speed parameter(s)
         sigma : float or ndarray
             Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
         r : float
             Discount rate
         L : float or ndarray
-            Loss level parameter(s)
+            Loss level as spread (L - theta)
         exit_level : float or ndarray
-            Optimal exit level parameter(s)
-        h : float, optional
-            Step size for finite difference (default: 1e-6)
+            Exit level as spread (exit_level - theta)
+        h : float or None, optional
+            Step size for finite difference (default: None, uses module constant H)
         use_analytical : bool, optional
             If True, use analytical F and G functions (default: False)
 
@@ -1355,13 +1465,14 @@ class OrnsteinUhlenbeck(StochasticModel):
             Scalar if all inputs are scalar, otherwise array with shape
             determined by broadcasting the input arrays
         """
+        if h is None:
+            h = H
         return (
             OrnsteinUhlenbeck.V_L(
                 x + h,
                 c=c,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
                 r=r,
                 L=L,
                 exit_level=exit_level,
@@ -1372,7 +1483,6 @@ class OrnsteinUhlenbeck(StochasticModel):
                 c=c,
                 mu=mu,
                 sigma=sigma,
-                theta=theta,
                 r=r,
                 L=L,
                 exit_level=exit_level,
@@ -1382,381 +1492,307 @@ class OrnsteinUhlenbeck(StochasticModel):
 
     @staticmethod
     def get_optimal_exit_level(
-        mu: float | np.ndarray,
-        sigma: float | np.ndarray,
-        theta: float | np.ndarray,
-        r: float = 0.01,
-        c: float | np.ndarray = 0.001,
-        L: Optional[float | np.ndarray] = None,
-        use_analytical: bool = False,
-    ) -> float | np.ndarray:
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        theta: np.ndarray,
+        discount_rate: float = 0.01,
+        transaction_cost: float = 0.01,
+        max_iter: int = 1000,
+        tol: float = 1e-6,
+        n_grid: int = 1000,
+        degenerate_threshold: float = DEGENERATE_OU_THRESHOLD,
+    ):
         """
-        Computes the optimal exit level (exit_level) for an OU process.
-        Uses Newton's method for root finding.
+        Vectorized computation of the Ornstein-Uhlenbeck optimal exit level given process parameters.
 
-        Parameters
-        ----------
-        mu : float or ndarray
-            Mean reversion speed parameter(s)
-        sigma : float or ndarray
-            Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
-        r : float, optional
-            Discount rate (default: 0.01)
-        c : float or ndarray, optional
-            Transaction cost to enter the trade (default: 0.001)
-        L : float or ndarray, optional
-            Loss level to exit the trade. If None, defaults to theta - 2*sigma (default: None)
-        use_analytical : bool, optional
-            If True, use analytical F and G functions (default: False)
+        Uses a grid search over spreads to find initial guesses, then refines with Newton's method.
 
-        Returns
-        -------
-        float or ndarray
-            Optimal exit level (exit_level) - should be well above theta.
-            Scalar if all inputs are scalar, otherwise array with shape
-            determined by broadcasting the input arrays
+        All arguments must be 1D numpy arrays of the same shape.
+        Returns: 1D numpy array of exit_levels, or np.nan for positions where
+        mu or sigma < degenerate_threshold (degenerate OU process) or any input is NaN/inf.
         """
-        # Convert to arrays and broadcast
-        mu_arr = np.atleast_1d(mu)
-        sigma_arr = np.atleast_1d(sigma)
-        theta_arr = np.atleast_1d(theta)
-        c_arr = np.atleast_1d(c) if not np.isscalar(c) else np.array([c])
+        mu = np.asarray(mu)
+        sigma = np.asarray(sigma)
+        theta = np.asarray(theta)
 
-        # Broadcast all arrays to the same shape
-        mu_arr, sigma_arr, theta_arr, c_arr = np.broadcast_arrays(
-            mu_arr, sigma_arr, theta_arr, c_arr
+        # Initialize result with NaN
+        result = np.full_like(mu, np.nan)
+
+        # Filter out degenerate OU processes and invalid inputs.
+        # mu < threshold: degenerates to Brownian motion (no mean reversion, r/mu diverges)
+        # sigma < threshold: degenerates to deterministic process (no stochastic component)
+        valid = (
+            (mu >= degenerate_threshold)
+            & (sigma >= degenerate_threshold)
+            & np.isfinite(mu)
+            & np.isfinite(sigma)
+            & np.isfinite(theta)
         )
+        if not np.any(valid):
+            return result
 
-        # Handle L
-        if L is None:
-            L_arr = theta_arr - 2 * sigma_arr
+        mu_v = mu[valid]
+        sigma_v = sigma[valid]
+        theta_v = theta[valid]
+        r = discount_rate
+        c = transaction_cost
+
+        # Function f(x) operating on absolute positions
+        def f_exit_level(x, mu, sigma, theta, r, c):
+            return (x - c) * OrnsteinUhlenbeck.F(
+                x, mu, sigma, theta=theta, r=r, derivative=1, use_analytical=True
+            ) - OrnsteinUhlenbeck.F(x, mu, sigma, theta=theta, r=r, use_analytical=True)
+
+        # Derivative of f(x) using analytical second derivative
+        def f_prime_exit_level(x, mu, sigma, theta, r, c):
+            return (x - c) * OrnsteinUhlenbeck.F(
+                x, mu, sigma, theta=theta, r=r, derivative=2, use_analytical=True
+            )
+
+        # Grid search for initial guesses (in absolute position space)
+        # For single parameter set, create 1D grid; for multiple, create 2D grid
+        if len(mu_v) == 1:
+            # Single parameter: create 1D grid for efficiency
+            x_grid = np.linspace(float(theta_v), float(theta_v + 100 * sigma_v), n_grid)
+            f_grid = f_exit_level(x_grid, mu_v, sigma_v, theta_v, r, c)
+            fp_grid = f_prime_exit_level(x_grid, mu_v, sigma_v, theta_v, r, c)
+            # Filter: f(x) > 0 and f'(x) > 0 (both must be positive)
+            f_search = np.where((f_grid > 0) & (fp_grid > 0), f_grid, np.inf)
+            x0 = np.array([x_grid[np.argmin(f_search)]])
         else:
-            L_arr = np.atleast_1d(L) if not np.isscalar(L) else np.array([L])
-            L_arr = np.broadcast_to(L_arr, mu_arr.shape)
+            # Multiple parameters: create 2D grid
+            # x_grid shape: (n_grid, n_params)
+            x_grid = np.linspace(theta_v, theta_v + 100 * sigma_v, n_grid)
+            f_grid = f_exit_level(x_grid, mu_v, sigma_v, theta_v, r, c)
+            fp_grid = f_prime_exit_level(x_grid, mu_v, sigma_v, theta_v, r, c)
+            # Filter: f(x) > 0 and f'(x) > 0 (both must be positive)
+            f_search = np.where((f_grid > 0) & (fp_grid > 0), f_grid, np.inf)
+            x0 = x_grid[np.argmin(f_search, axis=0), np.arange(len(mu_v))]
 
-        # Choose initial guess
-        initial_guess_arr = theta_arr + 10 * sigma_arr
-
-        # Pre-compute L-dependent values (constant for all elements)
-        F_L = OrnsteinUhlenbeck.F(
-            L_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
-        )
-        G_L = OrnsteinUhlenbeck.G(
-            L_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
-        )
-        # Ensure F_L and G_L are arrays with correct shape
-        F_L = np.asarray(F_L)
-        G_L = np.asarray(G_L)
-        if F_L.shape != mu_arr.shape:
-            F_L = np.broadcast_to(F_L, mu_arr.shape)
-        if G_L.shape != mu_arr.shape:
-            G_L = np.broadcast_to(G_L, mu_arr.shape)
-
-        # Define vectorized function to find root of: f(b) = f_left - f_right
-        def f_exit(b: float | np.ndarray, h: float = 1e-6) -> float | np.ndarray:
-            # Ensure b is properly shaped and broadcast with other arrays
-            b_arr = np.asarray(b)
-            if b_arr.shape != mu_arr.shape:
-                # Broadcast b to match mu_arr shape
-                b_arr = np.broadcast_to(b_arr, mu_arr.shape)
-
-            G_b = OrnsteinUhlenbeck.G(
-                b_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
+        # Newton's method
+        x = x0
+        active = np.ones(len(x), dtype=bool)
+        for _ in range(max_iter):
+            if not np.any(active):
+                break
+            f_val = f_exit_level(
+                x[active], mu_v[active], sigma_v[active], theta_v[active], r, c
             )
-            F_prime_b = OrnsteinUhlenbeck.F_prime(
-                b_arr,
-                mu_arr,
-                sigma_arr,
-                theta_arr,
-                r,
-                h=h,
-                use_analytical=use_analytical,
+            fp_val = f_prime_exit_level(
+                x[active], mu_v[active], sigma_v[active], theta_v[active], r, c
             )
-            F_b = OrnsteinUhlenbeck.F(
-                b_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
+            safe = (fp_val != 0) & np.isfinite(fp_val) & np.isfinite(f_val)
+            step = np.zeros_like(f_val)
+            np.divide(f_val, fp_val, out=step, where=safe)
+            x[active] = x[active] - step
+            active_idx = np.flatnonzero(active)
+            # NaN out elements that hit invalid values
+            x[active_idx[~safe]] = np.nan
+            done = (np.abs(f_val) < tol) | ~safe
+            active[active_idx[done]] = False
+
+        # Set non-converged values to NaN
+        n_unconverged = np.sum(active)
+        if n_unconverged > 0:
+            warnings.warn(
+                f"get_optimal_exit_level: {n_unconverged} roots did not converge "
+                f"within {max_iter} iterations."
             )
-            G_prime_b = OrnsteinUhlenbeck.G_prime(
-                b_arr,
-                mu_arr,
-                sigma_arr,
-                theta_arr,
-                r,
-                h=h,
-                use_analytical=use_analytical,
-            )
+            x[active] = np.nan
 
-            f_left = ((L_arr - c_arr) * G_b - (b_arr - c_arr) * F_prime_b) + (
-                (b_arr - c_arr) * F_L - (L_arr - c_arr) * F_b
-            ) * G_prime_b
-
-            f_right = G_b * F_L - G_L * F_b
-
-            return f_left - f_right
-
-        # Define vectorized derivative using numerical differentiation
-        def df_exit_dx(b: float | np.ndarray, h: float = 1e-6) -> float | np.ndarray:
-            b_arr = np.asarray(b)
-            if b_arr.shape != mu_arr.shape:
-                b_arr = np.broadcast_to(b_arr, mu_arr.shape)
-            return (f_exit(b_arr + h, h) - f_exit(b_arr - h, h)) / (2 * h)
-
-        # Use Newton's method to find result
-        # Exit level must be > theta
-        result = newton_vectorized(
-            f_exit,
-            df_exit_dx,
-            initial_guess_arr,
-            max_iter=50,
-            tol=1e-8,
-            step_direction="negative",
-        )
-
-        # Ensure result is properly shaped
-        result = np.asarray(result)
-        if result.shape != mu_arr.shape:
-            result = np.broadcast_to(result, mu_arr.shape)
-
-        # Return scalar if input was scalar
-        if (
-            np.isscalar(mu)
-            and np.isscalar(sigma)
-            and np.isscalar(theta)
-            and np.isscalar(c)
-            and (L is None or np.isscalar(L))
-        ):
-            # Extract single element before converting to float
-            if isinstance(result, np.ndarray):
-                return float(result.item())
-            return float(result)
-
+        # Result is already in absolute positions
+        result[valid] = x
         return result
 
     @staticmethod
     def get_optimal_entry_level(
-        mu: float | np.ndarray,
-        sigma: float | np.ndarray,
-        theta: float | np.ndarray,
-        r: float = 0.01,
-        c: float | np.ndarray = 0.001,
-        L: Optional[float | np.ndarray] = None,
-        h: float = 1e-6,
-        initial_guess: Optional[float | np.ndarray] = None,
-        exit_level: Optional[float | np.ndarray] = None,
-        use_analytical: bool = False,
-    ) -> float | np.ndarray:
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        theta: np.ndarray,
+        exit_level: np.ndarray,
+        discount_rate: float,
+        transaction_cost: float,
+        max_iter: int = 1000,
+        tol: float = 1e-6,
+        n_grid: int = 1000,
+        degenerate_threshold: float = DEGENERATE_OU_THRESHOLD,
+    ):
         """
-        Computes the optimal entry level (d_star) for an OU process.
-        Uses Newton's method for root finding.
+        Compute optimal entry level using grid search for initial guess then Newton's method.
 
-        Parameters
-        ----------
-        mu : float or ndarray
-            Mean reversion speed parameter(s)
-        sigma : float or ndarray
-            Volatility parameter(s)
-        theta : float or ndarray
-            Long-term mean parameter(s)
-        r : float, optional
-            Discount rate (default: 0.01)
-        c : float or ndarray, optional
-            Transaction cost to enter the trade (default: 0.001)
-        L : float or ndarray, optional
-            Loss level to exit the trade. If None, defaults to theta - 2*sigma (default: None)
-        h : float, optional
-            Step size for numerical differentiation (default: 1e-6)
-        initial_guess : ndarray, optional
-            Starting point(s) for root finding. Should be a vector of the same length/shape as
-            the broadcasted mu, sigma, and theta arrays. Each element will be used as the initial
-            guess for the corresponding parameter set. If None, defaults to multiple guesses
-            based on L and theta (default: None)
-        exit_level : float or ndarray, optional
-            Pre-computed optimal exit level. If None, will be computed (default: None)
-        use_analytical : bool, optional
-            If True, use analytical F and G functions (default: False)
-
-        Returns
-        -------
-        float or ndarray
-            Optimal entry level (d_star) - should be below theta.
-            Scalar if all inputs are scalar, otherwise array with shape
-            determined by broadcasting the input arrays
+        All arguments must be 1D numpy arrays of the same shape.
+        Returns: 1D numpy array of entry levels (absolute values), or np.nan where
+        mu or sigma < degenerate_threshold (degenerate OU process) or any input is NaN/inf.
         """
-        # Convert to arrays and broadcast
-        mu_arr = np.atleast_1d(mu)
-        sigma_arr = np.atleast_1d(sigma)
-        theta_arr = np.atleast_1d(theta)
-        c_arr = np.atleast_1d(c) if not np.isscalar(c) else np.array([c])
+        mu = np.asarray(mu)
+        sigma = np.asarray(sigma)
+        theta = np.asarray(theta)
+        exit_level = np.asarray(exit_level)
 
-        # Broadcast all arrays to the same shape
-        mu_arr, sigma_arr, theta_arr, c_arr = np.broadcast_arrays(
-            mu_arr, sigma_arr, theta_arr, c_arr
+        # Initialize result with NaN
+        result = np.full_like(mu, np.nan)
+
+        # Filter out degenerate OU processes and invalid inputs.
+        # mu < threshold: degenerates to Brownian motion (no mean reversion, r/mu diverges)
+        # sigma < threshold: degenerates to deterministic process (no stochastic component)
+        valid = (
+            (mu >= degenerate_threshold)
+            & (sigma >= degenerate_threshold)
+            & np.isfinite(mu)
+            & np.isfinite(sigma)
+            & np.isfinite(theta)
+            & np.isfinite(exit_level)
         )
+        if not np.any(valid):
+            return result
 
-        # Handle L
-        if L is None:
-            L_arr = theta_arr - 2 * sigma_arr
+        mu_v = mu[valid]
+        sigma_v = sigma[valid]
+        theta_v = theta[valid]
+        exit_level_v = exit_level[valid]
+        r = discount_rate
+        c = transaction_cost
+
+        # Function f(x) operating on absolute positions
+        def f_entry_level(x, mu, sigma, theta, r, c, exit_level):
+            return (
+                OrnsteinUhlenbeck.G(
+                    x, mu, sigma, theta=theta, r=r, derivative=1, use_analytical=True
+                )
+                * (
+                    OrnsteinUhlenbeck.V(
+                        x,
+                        mu,
+                        sigma,
+                        theta=theta,
+                        r=r,
+                        c=c,
+                        exit_level=exit_level,
+                        use_analytical=True,
+                    )
+                    - x
+                    - c
+                )
+            ) - (
+                OrnsteinUhlenbeck.G(x, mu, sigma, theta=theta, r=r, use_analytical=True)
+                * (
+                    OrnsteinUhlenbeck.V_prime(
+                        x,
+                        mu,
+                        sigma,
+                        theta=theta,
+                        r=r,
+                        c=c,
+                        exit_level=exit_level,
+                        use_analytical=True,
+                    )
+                    - 1
+                )
+            )
+
+        # Derivative of f(x) using analytical second derivative
+        def f_prime_entry_level(x, mu, sigma, theta, r, c, exit_level):
+            return (
+                OrnsteinUhlenbeck.G(
+                    x, mu, sigma, theta=theta, r=r, derivative=2, use_analytical=True
+                )
+                * (
+                    OrnsteinUhlenbeck.V(
+                        x,
+                        mu,
+                        sigma,
+                        theta=theta,
+                        r=r,
+                        c=c,
+                        exit_level=exit_level,
+                        use_analytical=True,
+                    )
+                    - x
+                    - c
+                )
+            ) - (
+                OrnsteinUhlenbeck.G(x, mu, sigma, theta=theta, r=r, use_analytical=True)
+                * (
+                    OrnsteinUhlenbeck.V_double_prime(
+                        x,
+                        mu,
+                        sigma,
+                        theta=theta,
+                        r=r,
+                        c=c,
+                        exit_level=exit_level,
+                        use_analytical=True,
+                    )
+                )
+            )
+
+        # Grid search for initial guesses (in absolute position space)
+        # For single parameter set, create 1D grid; for multiple, create 2D grid
+        if len(mu_v) == 1:
+            # Single parameter: create 1D grid for efficiency
+            x_grid = np.linspace(float(theta_v - 100 * sigma_v), float(theta_v), n_grid)
+            f_grid = f_entry_level(x_grid, mu_v, sigma_v, theta_v, r, c, exit_level_v)
+            fp_grid = f_prime_entry_level(
+                x_grid, mu_v, sigma_v, theta_v, r, c, exit_level_v
+            )
+            # Filter: f(x) < 0 and f'(x) > 0
+            f_search = np.where((f_grid < 0) & (fp_grid > 0), f_grid, np.inf)
+            x0 = np.array([x_grid[np.argmin(f_search)]])
         else:
-            L_arr = np.atleast_1d(L) if not np.isscalar(L) else np.array([L])
-            L_arr = np.broadcast_to(L_arr, mu_arr.shape)
-
-        # Get exit_level first (needed for d_star calculation) if not provided
-        if exit_level is None:
-            exit_level_arr = OrnsteinUhlenbeck.get_optimal_exit_level(
-                mu=mu_arr,
-                sigma=sigma_arr,
-                theta=theta_arr,
-                r=r,
-                c=c_arr,
-                L=L_arr,
-                h=h,
-                use_analytical=use_analytical,
+            # Multiple parameters: create 2D grid
+            # x_grid shape: (n_grid, n_params)
+            x_grid = np.linspace(theta_v - 100 * sigma_v, theta_v, n_grid)
+            f_grid = f_entry_level(x_grid, mu_v, sigma_v, theta_v, r, c, exit_level_v)
+            fp_grid = f_prime_entry_level(
+                x_grid, mu_v, sigma_v, theta_v, r, c, exit_level_v
             )
-            exit_level_arr = np.atleast_1d(exit_level_arr)
-        else:
-            exit_level_arr = (
-                np.atleast_1d(exit_level)
-                if not np.isscalar(exit_level)
-                else np.array([exit_level])
-            )
-            exit_level_arr = np.broadcast_to(exit_level_arr, mu_arr.shape)
+            # Filter: f(x) < 0 and f'(x) > 0
+            f_search = np.where((f_grid < 0) & (fp_grid > 0), f_grid, np.inf)
+            x0 = x_grid[np.argmin(f_search, axis=0), np.arange(len(mu_v))]
 
-        # Handle initial_guess
-        # Entry level should be between L and theta
-        if initial_guess is None:
-            # Default guess: middle of [L, theta]
-            range_size = theta_arr - L_arr
-            initial_guess_arr = L_arr + 0.5 * range_size
-        else:
-            # initial_guess should be a vector of the same shape as broadcasted arrays
-            initial_guess_arr = np.asarray(initial_guess)
-            if initial_guess_arr.ndim == 0:
-                # Scalar provided - broadcast to match shape
-                initial_guess_arr = np.broadcast_to(initial_guess_arr, mu_arr.shape)
-            else:
-                # Vector provided - ensure it can be broadcast to match shape
-                try:
-                    initial_guess_arr = np.broadcast_to(
-                        initial_guess_arr, mu_arr.shape
-                    ).copy()
-                except ValueError as e:
-                    raise ValueError(
-                        f"initial_guess must be broadcastable to shape {mu_arr.shape} "
-                        f"(matching mu, sigma, theta after broadcasting), got shape {initial_guess_arr.shape}"
-                    ) from e
-            # Ensure initial guess is between L and theta
-            initial_guess_arr = np.maximum(initial_guess_arr, L_arr + 0.001)
-            initial_guess_arr = np.minimum(initial_guess_arr, theta_arr - 0.001)
-
-        # Define vectorized function to find root of: f(d) = f_left - f_right
-        def f_entry(d):
-            # Ensure d is properly shaped and broadcast with other arrays
-            d_arr = np.asarray(d)
-            if d_arr.shape != mu_arr.shape:
-                # Broadcast d to match mu_arr shape
-                d_arr = np.broadcast_to(d_arr, mu_arr.shape)
-
-            G_d = OrnsteinUhlenbeck.G(
-                d_arr, mu_arr, sigma_arr, theta_arr, r, use_analytical=use_analytical
-            )
-            V_prime_d = OrnsteinUhlenbeck.V_L_prime(
-                d_arr,
-                c_arr,
-                mu_arr,
-                sigma_arr,
-                theta_arr,
+        # Newton's method
+        x = x0
+        active = np.ones(len(x), dtype=bool)
+        for _ in range(max_iter):
+            if not np.any(active):
+                break
+            f_val = f_entry_level(
+                x[active],
+                mu_v[active],
+                sigma_v[active],
+                theta_v[active],
                 r,
-                L_arr,
-                exit_level_arr,
-                h,
-                use_analytical=use_analytical,
+                c,
+                exit_level_v[active],
             )
-            G_prime_d = OrnsteinUhlenbeck.G_prime(
-                d_arr,
-                mu_arr,
-                sigma_arr,
-                theta_arr,
+            fp_val = f_prime_entry_level(
+                x[active],
+                mu_v[active],
+                sigma_v[active],
+                theta_v[active],
                 r,
-                h=h,
-                use_analytical=use_analytical,
+                c,
+                exit_level_v[active],
             )
-            V_d = OrnsteinUhlenbeck.V_L(
-                d_arr,
-                c_arr,
-                mu_arr,
-                sigma_arr,
-                theta_arr,
-                r,
-                L_arr,
-                exit_level_arr,
-                use_analytical=use_analytical,
+            safe = (fp_val != 0) & np.isfinite(fp_val) & np.isfinite(f_val)
+            step = np.zeros_like(f_val)
+            np.divide(f_val, fp_val, out=step, where=safe)
+            x[active] = x[active] - step
+            active_idx = np.flatnonzero(active)
+            # NaN out elements that hit invalid values
+            x[active_idx[~safe]] = np.nan
+            done = (np.abs(f_val) < tol) | ~safe
+            active[active_idx[done]] = False
+
+        # Set non-converged values to NaN
+        n_unconverged = np.sum(active)
+        if n_unconverged > 0:
+            warnings.warn(
+                f"get_optimal_entry_level: {n_unconverged} roots did not converge "
+                f"within {max_iter} iterations."
             )
+            x[active] = np.nan
 
-            f_left = G_d * (V_prime_d - 1)
-            f_right = G_prime_d * (V_d - d_arr - c_arr)
-
-            return f_left - f_right
-
-        # Define vectorized derivative using numerical differentiation
-        def df_entry_dx(d):
-            d_arr = np.asarray(d)
-            if d_arr.shape != mu_arr.shape:
-                d_arr = np.broadcast_to(d_arr, mu_arr.shape)
-            h_num = 1e-6
-            return (f_entry(d_arr + h_num) - f_entry(d_arr - h_num)) / (2 * h_num)
-
-        # Use Newton's method to find result
-        # Entry level must be between L and theta
-        result = newton_vectorized(
-            f_entry,
-            df_entry_dx,
-            initial_guess_arr,
-            max_iter=50,
-            tol=1e-8,
-            step_direction="positive",
-        )
-        # Validate result is in valid range
-        result = np.asarray(result)
-        if result.shape != mu_arr.shape:
-            result = np.broadcast_to(result, mu_arr.shape)
-        # If result is not in [L, theta], it's invalid - use analytical as fallback
-        invalid_mask = (result <= L_arr) | (result >= theta_arr)
-        if np.any(invalid_mask):
-            analytical_result = OrnsteinUhlenbeck.get_optimal_entry_level(
-                mu=mu_arr[invalid_mask] if mu_arr.ndim > 0 else mu,
-                sigma=sigma_arr[invalid_mask] if sigma_arr.ndim > 0 else sigma,
-                theta=theta_arr[invalid_mask] if theta_arr.ndim > 0 else theta,
-                r=r,
-                c=c_arr[invalid_mask] if c_arr.ndim > 0 else c,
-                L=L_arr[invalid_mask] if L_arr.ndim > 0 else L,
-                exit_level=exit_level_arr[invalid_mask]
-                if exit_level_arr.ndim > 0
-                else exit_level_arr,
-                use_analytical=True,
-            )
-            if isinstance(analytical_result, np.ndarray):
-                result[invalid_mask] = analytical_result
-            else:
-                result[invalid_mask] = analytical_result
-
-        # Ensure result is properly shaped
-        result = np.asarray(result)
-        if result.shape != mu_arr.shape:
-            result = np.broadcast_to(result, mu_arr.shape)
-
-        # Return scalar if input was scalar
-        if (
-            np.isscalar(mu)
-            and np.isscalar(sigma)
-            and np.isscalar(theta)
-            and np.isscalar(c)
-            and (L is None or np.isscalar(L))
-            and (exit_level is None or np.isscalar(exit_level))
-        ):
-            # Extract single element before converting to float
-            if isinstance(result, np.ndarray):
-                return float(result.item())
-            return float(result)
-
+        # Result is already in absolute positions
+        result[valid] = x
         return result

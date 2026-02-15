@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from statsmodels.regression.rolling import RollingOLS
 from statsmodels.tsa.stattools import mackinnonp, mackinnoncrit
 from statsmodels.tsa.tsatools import lagmat
-import statsmodels.api as sm
 
 from . import OrnsteinUhlenbeck
 from .base import DELTA_T
@@ -17,8 +16,7 @@ class RollingCointegrationResults:
     Results from rolling cointegration test.
     """
 
-    beta: NDArray[np.float64]  # 1D array of float64
-    alpha: NDArray[np.float64]  # 1D array of float64
+    beta: NDArray[np.float64]  # 1D array of float64 - hedge ratio
     coint_t: NDArray[np.float64]  # 1D array of float64
     pvalue: NDArray[np.float64]  # 1D array of float64
     crit_1pct: NDArray[np.float64]  # 1D array of float64
@@ -93,7 +91,7 @@ def _build_adf_matrices(
 
 class RollingCointegration:
     """
-    Rolling cointegration test.
+    Rolling cointegration test with no intercept (hedge ratio only).
     """
 
     def __init__(
@@ -120,7 +118,8 @@ class RollingCointegration:
         """
         Fit the rolling cointegration model.
 
-        Performs rolling cointegrating regression and ADF test on residuals.
+        Performs rolling cointegrating regression (no intercept) and ADF test on residuals.
+        Model: y0 = beta * y1 + residuals (spread)
         """
         # Input validation
         y0 = np.asarray(self.y0, dtype=np.float64).squeeze()
@@ -138,19 +137,14 @@ class RollingCointegration:
             raise ValueError(f"window must be at least lag + 5 = {self.lag + 5}")
 
         # =========================================================================
-        # STAGE 1: Rolling cointegrating regression
-        # y0 = alpha + beta*y1 + residuals (spread)
+        # STAGE 1: Rolling cointegrating regression (NO INTERCEPT)
+        # y0 = beta*y1 + residuals (spread)
         # =========================================================================
 
-        # Prepare exogenous: [y1, const] or just [y1] if no trend
-        if self.trend == "n":
-            exog = y1.reshape(-1, 1)
-        else:
-            exog = sm.add_constant(y1)  # [const, y1] -> need to reorder
-            # add_constant puts const first, we want [y1, const] for consistency
-            exog = exog[:, ::-1]  # Now [y1, const]
+        # Prepare exogenous: just [y1] with no constant
+        exog = y1.reshape(-1, 1)
 
-        # Run RollingOLS for cointegrating regression
+        # Run RollingOLS for cointegrating regression (no intercept)
         rolling_coint_model = RollingOLS(
             endog=y0,
             exog=exog,
@@ -162,14 +156,9 @@ class RollingCointegration:
             method=method, params_only=False
         )
 
-        # Extract parameters
+        # Extract hedge ratio (beta)
         params = rolling_coint_results.params
-        beta = params[:, 0].copy()  # Coefficient on y1
-
-        if self.trend == "n":
-            alpha = np.zeros(nobs)  # No intercept
-        else:
-            alpha = params[:, 1].copy()  # Constant term
+        beta = params.squeeze().copy()  # Hedge ratio on y1
 
         # =========================================================================
         # STAGE 2: Rolling ADF test on spread (cointegration test)
@@ -207,7 +196,7 @@ class RollingCointegration:
         # Main loop: For each window, compute spread and ADF test
         for t in range(first_idx - 1, nobs):
             # Skip if parameters not available
-            if np.any(np.isnan(params[t])):
+            if np.isnan(beta[t]):
                 continue
 
             # Get window bounds
@@ -217,10 +206,10 @@ class RollingCointegration:
                 w_start = t - self.window + 1
             w_end = t + 1
 
-            # Compute spread for this window using THIS window's params
+            # Compute spread for this window using THIS window's beta (no alpha)
             y0_window = y0[w_start:w_end]
             y1_window = y1[w_start:w_end]
-            spread_window = y0_window - beta[t] * y1_window - alpha[t]
+            spread_window = y0_window - beta[t] * y1_window
 
             # Compute residual statistics
             residual_mean[t] = np.mean(spread_window)
@@ -266,7 +255,6 @@ class RollingCointegration:
 
         return RollingCointegrationResults(
             beta=beta,
-            alpha=alpha,
             coint_t=coint_t,
             pvalue=pvalue,
             crit_1pct=crit_1pct,
@@ -280,12 +268,11 @@ class RollingCointegration:
 
 class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
     """
-    Rolling Ornstein-Uhlenbeck parameter estimation.
+    Rolling Ornstein-Uhlenbeck parameter estimation (no intercept).
     """
 
     def __init__(
         self,
-        alpha: NDArray[np.float64],
         beta: NDArray[np.float64],
         y0: NDArray[np.float64],
         y1: NDArray[np.float64],
@@ -295,7 +282,6 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
         expanding: bool = False,
     ):
         # Don't call super().__init__() since we're not using params-based initialization
-        self.alpha = alpha
         self.beta = beta
         self.y0 = y0
         self.y1 = y1
@@ -308,12 +294,11 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
         """
         Fit the rolling Ornstein-Uhlenbeck model.
 
-        Performs rolling OU parameter estimation on spread.
+        Performs rolling OU parameter estimation on spread (no intercept).
         """
         # Input validation
         y0 = np.asarray(self.y0, dtype=np.float64).squeeze()
         y1 = np.asarray(self.y1, dtype=np.float64).squeeze()
-        alpha = np.asarray(self.alpha, dtype=np.float64)
         beta = np.asarray(self.beta, dtype=np.float64)
 
         if y0.ndim != 1 or y1.ndim != 1:
@@ -348,10 +333,10 @@ class RollingOrnsteinUhlenbeck(OrnsteinUhlenbeck):
                 w_start = t - self.window + 1
             w_end = t + 1
 
-            # Compute spread for this window using pre-computed alpha and beta
+            # Compute spread for this window using pre-computed beta (no alpha)
             y0_window = y0[w_start:w_end]
             y1_window = y1[w_start:w_end]
-            spread_window = y0_window - beta[t] * y1_window - alpha[t]
+            spread_window = y0_window - beta[t] * y1_window
 
             # Check for degenerate cases
             if len(spread_window) < 3 or np.std(spread_window, ddof=1) < 1e-10:

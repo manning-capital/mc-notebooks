@@ -23,6 +23,7 @@ dependencies = [
     "pytest>=9.0.2",
     "ruff>=0.12.5",
     "scikit-learn>=1.7.1",
+    "seaborn>=0.13.2",
     "setuptools>=80.9.0",
     "sqlalchemy>=2.0.41",
     "statsmodels>=0.14.5",

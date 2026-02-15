@@ -30,3 +30,8 @@ wheels/
 # Cursor
 .cursor
 .cursorrules
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
